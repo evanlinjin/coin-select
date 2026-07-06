@@ -636,10 +636,25 @@ impl<'a> CoinSelector<'a> {
             .inspect(|_| rounds += 1)
             .flatten()
             .last();
-        let (selector, score) = best.ok_or(NoBnbSolution { max_rounds, rounds })?;
-        let drain = iter.metric.drain(&selector, target);
-        *self = selector;
-        Ok((score, drain))
+        if let Some((selector, score)) = best {
+            let drain = iter.metric.drain(&selector, target);
+            *self = selector;
+            return Ok((score, drain));
+        }
+
+        // No solution. If the search ran to completion — fewer rounds than the limit, or a final
+        // pull confirms the iterator is drained — then no selection satisfies the target and this
+        // is a genuine infeasibility, split into value vs weight. Otherwise we merely hit the round
+        // limit and a solution may still exist with a larger `max_rounds`.
+        if rounds < max_rounds || iter.next().is_none() {
+            if self.is_fundable(target) {
+                Err(NoBnbSolution::MaxWeightExceeded)
+            } else {
+                Err(NoBnbSolution::InsufficientFunds)
+            }
+        } else {
+            Err(NoBnbSolution::RoundLimit { max_rounds, rounds })
+        }
     }
 }
 
@@ -742,22 +757,52 @@ impl core::fmt::Display for SelectError {
 #[cfg(feature = "std")]
 impl std::error::Error for SelectError {}
 
-/// Error type for when a solution cannot be found by branch-and-bound.
+/// Error returned by [`CoinSelector::run_bnb`] when it yields no solution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NoBnbSolution {
-    /// Maximum rounds set by the caller.
-    pub max_rounds: usize,
-    /// Number of branch-and-bound rounds performed.
-    pub rounds: usize,
+pub enum NoBnbSolution {
+    /// The candidates can't cover the target value, so no selection is possible.
+    InsufficientFunds,
+    /// Some selection covers the target value, but every one of them exceeds
+    /// [`Target::max_weight`].
+    ///
+    /// Only reachable with a metric that enforces the cap (e.g. [`LowestFee`]); a cap-blind metric
+    /// returns an over-cap selection rather than failing.
+    ///
+    /// [`LowestFee`]: crate::metrics::LowestFee
+    MaxWeightExceeded,
+    /// The round limit was reached before the search finished — a solution may still exist with a
+    /// larger `max_rounds`.
+    RoundLimit {
+        /// Maximum rounds set by the caller.
+        max_rounds: usize,
+        /// Number of branch-and-bound rounds performed.
+        rounds: usize,
+    },
 }
 
+// Allow this for now due to MSRV
+#[allow(clippy::uninlined_format_args)]
 impl core::fmt::Display for NoBnbSolution {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "No bnb solution found after {} rounds (max rounds is {}).",
-            self.rounds, self.max_rounds
-        )
+        match self {
+            NoBnbSolution::InsufficientFunds => {
+                write!(
+                    f,
+                    "no bnb solution: candidates cannot cover the target value"
+                )
+            }
+            NoBnbSolution::MaxWeightExceeded => {
+                write!(
+                    f,
+                    "no bnb solution: no selection meets the target within max_weight"
+                )
+            }
+            NoBnbSolution::RoundLimit { max_rounds, rounds } => write!(
+                f,
+                "no bnb solution found after {} rounds (max rounds is {})",
+                rounds, max_rounds
+            ),
+        }
     }
 }
 
