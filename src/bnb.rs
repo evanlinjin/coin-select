@@ -66,12 +66,19 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
         }
 
         self.insert_new_branches(&selector);
-        Some(return_val.map(|score| (selector, score)))
+        // What escapes to the caller is priced exactly: the local model over-reserves, and the
+        // difference belongs in the change output rather than silently in the fee.
+        Some(return_val.map(|score| (selector.priced_exactly(), score)))
     }
 }
 
 impl<'a, M: BnbMetric> BnbIter<'a, M> {
-    pub(crate) fn new(mut selector: CoinSelector<'a>, metric: M) -> Self {
+    pub(crate) fn new(selector: CoinSelector<'a>, metric: M) -> Self {
+        // Search on the local (per-candidate) ancestor bump model. It is additive, so every figure
+        // a metric sees -- the per-candidate effective values, the excess, the bounds -- is
+        // consistent and each metric's correctness argument holds as written. Solutions are handed
+        // back exactly priced; see `Iterator::next`.
+        let mut selector = selector.priced_locally();
         let mut iter = BnbIter {
             queue: BinaryHeap::default(),
             best: None,
@@ -137,12 +144,14 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         inclusion_cs.select(next_index);
         self.consider_adding_to_queue(&inclusion_cs, false);
 
-        // for the exclusion branch, we keep banning if candidates have the same weight and value
+        // For the exclusion branch, keep banning while candidates are interchangeable. The
+        // ancestor bump is part of what a candidate costs, so two inputs of equal value and weight
+        // are *not* interchangeable when they drag in different unconfirmed ancestors.
         let mut is_first_ban = true;
         let mut exclusion_cs = cs.clone();
-        let to_ban = (next.value, next.weight);
+        let to_ban = (next.value, next.weight, cs.ancestor_bump_fee_of(next_index));
         for (next_index, next) in cs.unselected() {
-            if (next.value, next.weight) != to_ban {
+            if (next.value, next.weight, cs.ancestor_bump_fee_of(next_index)) != to_ban {
                 break;
             }
             let (_index, _candidate) = exclusion_cs

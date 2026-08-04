@@ -13,6 +13,12 @@ extern crate std;
 
 mod bitset;
 pub use bitset::*;
+mod bump_table;
+pub use bump_table::*;
+mod mempool;
+pub use mempool::*;
+#[cfg(test)]
+mod ancestor_search_experiment;
 mod coin_selector;
 pub mod float;
 pub use coin_selector::*;

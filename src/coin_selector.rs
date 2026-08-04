@@ -1,12 +1,31 @@
 use super::*;
 #[allow(unused)] // some bug in <= 1.48.0 sees this as unused when it isn't
 use crate::float::FloatExt;
-use crate::{bitset::Bitset, bnb::BnbMetric, float::Ordf32, ChangePolicy, FeeRate, Target};
+use crate::{
+    bitset::Bitset, bnb::BnbMetric, bump_table::BumpTable, float::Ordf32, ChangePolicy, FeeRate,
+    Target,
+};
 use alloc::{sync::Arc, vec::Vec};
 
 /// The minimum change amount Bitcoin Core's `SelectCoinsSRD` targets; a sensible default for the
 /// `change_lower` argument of [`CoinSelector::select_srd`].
 pub const CHANGE_LOWER: u64 = 50_000;
+
+/// Which ancestor-bump model a [`CoinSelector`] answers with.
+///
+/// The CPFP bump is a property of the *package*: an ancestor two candidates share is paid for
+/// once. That makes it non-additive, and non-additive figures break the selection algorithms,
+/// which rank and accumulate per candidate. So there are two models, and a selector commits to one
+/// at a time rather than mixing them — a bound computed against one model and scored against the
+/// other is not a bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pricing {
+    /// The package figure: exact, non-additive. What every public method reports.
+    Exact,
+    /// The sum of per-candidate figures: additive, and never below the exact one. What branch and
+    /// bound searches on.
+    Local,
+}
 
 /// [`CoinSelector`] selects/deselects coins from a set of canididate coins.
 ///
@@ -22,6 +41,10 @@ pub struct CoinSelector<'a> {
     /// built for one target and evaluated against it throughout, and threading it through every
     /// method made it possible to ask two different questions of the same selection.
     target: Target,
+    /// Exact CPFP pricing (via [`CoinSelector::with_bump_table`]).
+    bump_table: Option<&'a BumpTable>,
+    /// Which of the two ancestor-bump models this selector answers with. See [`Pricing`].
+    pricing: Pricing,
     selected: Bitset,
     banned: Bitset,
     candidate_order: Arc<Vec<usize>>,
@@ -47,6 +70,8 @@ impl<'a> CoinSelector<'a> {
         Self {
             candidates,
             target,
+            bump_table: None,
+            pricing: Pricing::Exact,
             selected: Bitset::with_capacity(candidates.len()),
             banned: Bitset::with_capacity(candidates.len()),
             candidate_order: Arc::new((0..candidates.len()).collect::<Vec<_>>()),
@@ -56,6 +81,71 @@ impl<'a> CoinSelector<'a> {
     /// What this selector is funding. Fixed at construction.
     pub fn target(&self) -> Target {
         self.target
+    }
+
+    /// Report CPFP package costs exactly, using `bump_table`.
+    ///
+    /// Nothing is banned: candidates with unconfirmed ancestors are selected like any other. That
+    /// works because the *search* reasons about [`effective_value_of`], which nets off each
+    /// candidate's individual bump and is therefore additive, while everything this selector reports —
+    /// [`excess`], [`implied_fee`], [`is_funded`], [`drain`] — uses the table's exact combined
+    /// figure, in which an ancestor shared by two candidates is paid for once.
+    ///
+    /// The two differ, and deliberately: the sum of per-candidate bumps is never below the
+    /// combined one, so the search *over*-reserves and the surplus surfaces as a larger change
+    /// output. See [`BumpTable`].
+    ///
+    /// # Panics
+    ///
+    /// If the table refers to a candidate index out of bounds for the slice passed to
+    /// [`CoinSelector::new`].
+    ///
+    /// [`effective_value_of`]: Self::effective_value_of
+    /// [`excess`]: Self::excess
+    /// [`implied_fee`]: Self::implied_fee
+    /// [`is_funded`]: Self::is_funded
+    /// [`drain`]: Self::drain
+    pub fn with_bump_table(mut self, bump_table: &'a BumpTable) -> Self {
+        if let Some(max) = bump_table.max_candidate_index() {
+            assert!(
+                max < self.candidates.len(),
+                "bump table refers to candidate index {} but there are only {} candidates",
+                max,
+                self.candidates.len()
+            );
+        }
+        self.bump_table = Some(bump_table);
+        self
+    }
+
+    /// The same selector, answering with the local (per-candidate) bump model.
+    ///
+    /// Branch and bound searches in this mode so that every figure a metric sees is additive
+    /// across candidates, which is what its ranking and its bounds assume. Selections handed back
+    /// to the caller are returned to [`Pricing::Exact`].
+    pub(crate) fn priced_locally(&self) -> Self {
+        let mut cs = self.clone();
+        cs.pricing = Pricing::Local;
+        cs
+    }
+
+    /// The same selector, answering with the exact (package) bump model.
+    pub(crate) fn priced_exactly(&self) -> Self {
+        let mut cs = self.clone();
+        cs.pricing = Pricing::Exact;
+        cs
+    }
+
+    /// The candidates that have unconfirmed ancestors, by index into the original `candidates`
+    /// slice passed to [`CoinSelector::new`].
+    ///
+    /// These are selectable like any other candidate; the [ancestor bump fee] is priced into every
+    /// excess calculation when they are chosen. This is a query about *pricing*, not about
+    /// selectability.
+    ///
+    /// [ancestor bump fee]: Self::selected_ancestor_bump_fee
+    pub fn candidates_with_ancestors(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bump_table.into_iter().flat_map(|t| t.candidates())
     }
 
     /// Iterate over all the candidates in their currently sorted order. Each item has the original
@@ -196,6 +286,84 @@ impl<'a> CoinSelector<'a> {
             + target_ouputs.output_weight_with_drain(drain_weight)
     }
 
+    /// The extra fee this selection owes on top of its own weight, so that its unconfirmed
+    /// ancestors reach `feerate` as a package (CPFP).
+    ///
+    /// Which of the two models answers depends on how this selector is priced. Everything a
+    /// caller can reach uses the **exact** figure — the [`BumpTable`]'s combined bump, in which an
+    /// ancestor shared by two selected candidates is paid for once, and which is what the
+    /// transaction actually owes.
+    ///
+    /// Branch and bound switches internally to the **local** figure — the sum of the selected
+    /// candidates' [`ancestor_bump_fee_of`] — additive, and therefore never below the exact one,
+    /// so its ranking and bounds can rely on it.
+    ///
+    /// Zero when neither a table nor per-candidate bumps were supplied.
+    ///
+    /// # Panics
+    ///
+    /// If `feerate` is not the one the table was built for. A table's figures are only valid at
+    /// its own feerate, and using them at another under-prices the package — in *both* directions,
+    /// so there is no safe side to land on. The check is one comparison and only runs when a table
+    /// is present, so it is not gated on debug builds.
+    ///
+    /// [`ancestor_bump_fee_of`]: Self::ancestor_bump_fee_of
+    pub fn selected_ancestor_bump_fee(&self, feerate: FeeRate) -> u64 {
+        let bump_table = match self.bump_table {
+            Some(bump_table) => bump_table,
+            None => return 0,
+        };
+        assert_eq!(
+            feerate,
+            bump_table.feerate(),
+            "bump table was built for a different feerate; its figures do not apply here"
+        );
+        match self.pricing {
+            Pricing::Local => self.selected.iter().map(|i| bump_table.individual(i)).sum(),
+            Pricing::Exact => bump_table.combined(&self.selected),
+        }
+    }
+
+    /// What selecting the candidate at `index` alone would owe to bring its unconfirmed ancestors
+    /// up to the target feerate, in satoshis. Zero without a [`BumpTable`], or for a candidate
+    /// with no unconfirmed ancestors.
+    ///
+    /// Additive across candidates, and never in total below what the package actually owes -- see
+    /// [`BumpTable`] for why that direction matters.
+    pub fn ancestor_bump_fee_of(&self, index: usize) -> u64 {
+        self.bump_table.map_or(0, |t| t.individual(index))
+    }
+
+    /// [`Candidate::effective_value`] less what that candidate's unconfirmed ancestors cost.
+    ///
+    /// This is the figure to rank candidates on. `Candidate` cannot compute it: a bump is only
+    /// meaningful at the feerate it was derived for, and a `Candidate` has nowhere to record
+    /// which -- so it lives here, where the [`BumpTable`] is, and the feerate can be checked.
+    ///
+    /// # Panics
+    ///
+    /// If `feerate` is not the one the attached table was built for.
+    pub fn effective_value_of(&self, index: usize, feerate: FeeRate) -> f32 {
+        if let Some(bump_table) = self.bump_table {
+            assert_eq!(
+                feerate,
+                bump_table.feerate(),
+                "bump table was built for a different feerate; its figures do not apply here"
+            );
+        }
+        self.candidates[index].effective_value(feerate) - self.ancestor_bump_fee_of(index) as f32
+    }
+
+    /// [`Candidate::value_pwu`] less what that candidate's unconfirmed ancestors cost, spread over
+    /// its weight. Needs no feerate of its own: the attached table fixes one.
+    pub fn value_pwu_of(&self, index: usize) -> f32 {
+        let candidate = self.candidates[index];
+        candidate
+            .value
+            .saturating_sub(self.ancestor_bump_fee_of(index)) as f32
+            / candidate.weight as f32
+    }
+
     /// How much the current selection overshoots the value needed to achieve `target`.
     ///
     /// In order for the resulting transaction to be valid this must be 0 or above. If it's above 0
@@ -222,7 +390,7 @@ impl<'a> CoinSelector<'a> {
         self.selected_value() as i64
             - self.target.value() as i64
             - drain.value as i64
-            - self.implied_fee_from_feerate(drain.weights) as i64
+            - self.implied_package_fee_from_feerate(drain.weights) as i64
     }
 
     /// Same as [rate_excess](Self::rate_excess) except `self.target.fee.rate` is applied to the
@@ -231,7 +399,7 @@ impl<'a> CoinSelector<'a> {
         self.selected_value() as i64
             - self.target.value() as i64
             - drain.value as i64
-            - self.implied_fee_from_feerate_wu(drain.weights) as i64
+            - self.implied_package_fee_from_feerate_wu(drain.weights) as i64
     }
 
     /// How much the current selection overshoots the value needed to satisfy `self.target.fee.absolute`
@@ -245,29 +413,19 @@ impl<'a> CoinSelector<'a> {
 
     /// How much the current selection overshoots the value needed to satisfy RBF's rule 4.
     pub fn replacement_excess(&self, drain: Drain) -> i64 {
-        let mut replacement_excess_needed = 0;
-        if let Some(replace) = self.target.fee.replace {
-            replacement_excess_needed =
-                replace.min_fee_to_do_replacement(self.weight(self.target.outputs, drain.weights))
-        }
         self.selected_value() as i64
             - self.target.value() as i64
             - drain.value as i64
-            - replacement_excess_needed as i64
+            - self.implied_package_fee_from_replacement(drain.weights) as i64
     }
 
     /// Same as [replacement_excess](Self::replacement_excess) except the replacement fee
     /// is calculated using weight units directly without any conversion to vbytes.
     pub fn replacement_excess_wu(&self, drain: Drain) -> i64 {
-        let mut replacement_excess_needed = 0;
-        if let Some(replace) = self.target.fee.replace {
-            replacement_excess_needed = replace
-                .min_fee_to_do_replacement_wu(self.weight(self.target.outputs, drain.weights))
-        }
         self.selected_value() as i64
             - self.target.value() as i64
             - drain.value as i64
-            - replacement_excess_needed as i64
+            - self.implied_package_fee_from_replacement_wu(drain.weights) as i64
     }
 
     /// The feerate the transaction would have if we were to use this selection of inputs to achieve
@@ -286,37 +444,71 @@ impl<'a> CoinSelector<'a> {
 
     /// The fee the current selection and `drain_weight` should pay to satisfy `target_fee`.
     ///
-    /// This compares the fee calculated from the target feerate with the fee calculated from the
-    /// [`Replace`] constraints and returns the larger of the two.
+    /// This is the largest of the fees implied by `self.target.fee.rate`, `self.target.fee.absolute` and the
+    /// [`Replace`] constraints. The feerate and replacement fees include any [ancestor bump fee];
+    /// `self.target.fee.absolute` is a minimum fee floor rather than an additive charge, so it does not.
+    ///
+    /// This is the exact counterpart of [`excess`](Self::excess):
+    /// `excess == selected_value - target.value() - drain.value - implied_fee`.
     ///
     /// `drain_weight` can be 0 to indicate no draining output.
+    ///
+    /// [ancestor bump fee]: Self::selected_ancestor_bump_fee
     pub fn implied_fee(&self, drain_weights: DrainWeights) -> u64 {
-        let mut implied_fee = self
-            .implied_fee_from_feerate(drain_weights)
-            .max(self.target.fee.absolute);
-
-        if let Some(replace) = self.target.fee.replace {
-            implied_fee = Ord::max(
-                implied_fee,
-                replace.min_fee_to_do_replacement(self.weight(self.target.outputs, drain_weights)),
-            );
-        }
-
-        implied_fee
+        self.implied_package_fee_from_feerate(drain_weights)
+            .max(self.target.fee.absolute)
+            .max(self.implied_package_fee_from_replacement(drain_weights))
     }
 
-    fn implied_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {
+    /// The fee implied by `self.target.fee.rate` for the whole CPFP package — this transaction plus any
+    /// unconfirmed ancestors — i.e. the fee for the transaction's own weight plus the [ancestor
+    /// bump fee].
+    ///
+    /// The bump is folded in here rather than at each call site because every caller needs it.
+    ///
+    /// [ancestor bump fee]: Self::selected_ancestor_bump_fee
+    fn implied_package_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {
         self.target
             .fee
             .rate
             .implied_fee(self.weight(self.target.outputs, drain_weights))
+            + self.selected_ancestor_bump_fee(self.target.fee.rate)
     }
 
-    fn implied_fee_from_feerate_wu(&self, drain_weights: DrainWeights) -> u64 {
+    /// Same as [`implied_package_fee_from_feerate`](Self::implied_package_fee_from_feerate) except `self.target.fee.rate`
+    /// is applied to weight units directly without any conversion to vbytes.
+    fn implied_package_fee_from_feerate_wu(&self, drain_weights: DrainWeights) -> u64 {
         self.target
             .fee
             .rate
             .implied_fee_wu(self.weight(self.target.outputs, drain_weights))
+            + self.selected_ancestor_bump_fee(self.target.fee.rate)
+    }
+
+    /// The fee needed for the whole CPFP package to satisfy RBF's rule 4, i.e. the replacement fee
+    /// plus the [ancestor bump fee]. No replacement (`self.target.fee.replace` is `None`) still leaves
+    /// the bump to pay.
+    ///
+    /// [ancestor bump fee]: Self::selected_ancestor_bump_fee
+    fn implied_package_fee_from_replacement(&self, drain_weights: DrainWeights) -> u64 {
+        let replacement_fee = match self.target.fee.replace {
+            Some(replace) => {
+                replace.min_fee_to_do_replacement(self.weight(self.target.outputs, drain_weights))
+            }
+            None => 0,
+        };
+        replacement_fee + self.selected_ancestor_bump_fee(self.target.fee.rate)
+    }
+
+    /// Same as [`implied_package_fee_from_replacement`](Self::implied_package_fee_from_replacement) except the
+    /// replacement fee is calculated using weight units directly without any conversion to vbytes.
+    fn implied_package_fee_from_replacement_wu(&self, drain_weights: DrainWeights) -> u64 {
+        let replacement_fee = match self.target.fee.replace {
+            Some(replace) => replace
+                .min_fee_to_do_replacement_wu(self.weight(self.target.outputs, drain_weights)),
+            None => 0,
+        };
+        replacement_fee + self.selected_ancestor_bump_fee(self.target.fee.rate)
     }
 
     /// The actual fee the selection would pay if it was used in a transaction that had
@@ -328,8 +520,11 @@ impl<'a> CoinSelector<'a> {
     }
 
     /// The value of the current selected inputs minus the fee needed to pay for the selected inputs
+    /// and any ancestor bump fee.
     pub fn effective_value(&self, feerate: FeeRate) -> i64 {
-        self.selected_value() as i64 - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
+        self.selected_value() as i64
+            - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
+            - self.selected_ancestor_bump_fee(feerate) as i64
     }
 
     // /// Waste sum of all selected inputs.
@@ -374,9 +569,10 @@ impl<'a> CoinSelector<'a> {
 
     /// Sorts the candidates by descending value per weight unit, tie-breaking with value.
     pub fn sort_candidates_by_descending_value_pwu(&mut self) {
-        self.sort_candidates_by_key(|(_, wv)| {
-            core::cmp::Reverse((Ordf32(wv.value_pwu()), wv.value))
-        });
+        let pwu = (0..self.candidates.len())
+            .map(|i| Ordf32(self.value_pwu_of(i)))
+            .collect::<Vec<_>>();
+        self.sort_candidates_by_key(|(i, wv)| core::cmp::Reverse((pwu[i], wv.value)));
     }
 
     /// Shuffle the candidates with Fisher-Yates algorithm.
@@ -498,6 +694,7 @@ impl<'a> CoinSelector<'a> {
     /// [`is_within_max_weight`]. See [`is_funded_with_drain`] for the version that
     /// accounts for a specific `drain`.
     ///
+    /// [`effective_value_of`]: Self::effective_value_of
     /// [`excess`]: Self::excess
     /// [`is_within_max_weight`]: Self::is_within_max_weight
     /// [`is_funded_with_drain`]: Self::is_funded_with_drain
@@ -563,15 +760,24 @@ impl<'a> CoinSelector<'a> {
     ///
     /// A candidate if effective if it provides more value than it takes to pay for at `feerate`.
     pub fn select_all_effective(&mut self, feerate: FeeRate) {
+        // `Candidate::effective_value` subtracts a bump computed for the table's feerate, so
+        // ranking at any other one is meaningless. See `Candidate::ancestor_bump_fee`.
+        if let Some(bump_table) = self.bump_table {
+            assert_eq!(
+                feerate,
+                bump_table.feerate(),
+                "bump table was built for a different feerate; its figures do not apply here"
+            );
+        }
         for i in 0..self.candidate_order.len() {
             let cand_index = self.candidate_order[i];
             if self.selected.contains(cand_index)
                 || self.banned.contains(cand_index)
-                || self.candidates[cand_index].effective_value(feerate) <= 0.0
+                || self.effective_value_of(cand_index, feerate) <= 0.0
             {
                 continue;
             }
-            self.selected.insert(cand_index);
+            self.select(cand_index);
         }
     }
 
@@ -712,6 +918,8 @@ impl<'a> CoinSelector<'a> {
             .flatten()
             .last();
         if let Some((selector, score)) = best {
+            // `selector` is already exactly priced (see `BnbIter::next`), so the drain the caller
+            // gets is sized by the true package cost rather than by the search's over-estimate.
             let drain = iter.metric.drain(&selector);
             *self = selector;
             return Ok((score, drain));
@@ -922,11 +1130,17 @@ impl Candidate {
     }
 
     /// Effective value of this input candidate: `actual_value - input_weight * feerate (sats/wu)`.
+    ///
+    /// Note this knows nothing about unconfirmed ancestors. Where candidates may have them, rank
+    /// on [`CoinSelector::effective_value_of`] instead, which nets off what the CPFP package costs.
     pub fn effective_value(&self, feerate: FeeRate) -> f32 {
         self.value as f32 - (self.weight as f32 * feerate.spwu())
     }
 
-    /// Value per weight unit
+    /// Value per weight unit.
+    ///
+    /// As with [`effective_value`](Self::effective_value), this ignores unconfirmed ancestors; see
+    /// [`CoinSelector::value_pwu_of`].
     pub fn value_pwu(&self) -> f32 {
         self.value as f32 / self.weight as f32
     }

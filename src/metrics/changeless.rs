@@ -25,6 +25,10 @@ impl<M: BnbMetric> Changeless<M> {
     /// NOTE: this relies on candidates being sorted so that all negative effective value candidates
     /// are next to each other, which [`requires_ordering_by_descending_value_pwu`] guarantees.
     ///
+    /// NOTE: it also needs the per-candidate figure to tell the whole story about how much a
+    /// candidate lowers the excess, which is why this uses `CoinSelector::effective_value_of`
+    /// rather than `Candidate::effective_value` -- the latter cannot see unconfirmed ancestors.
+    ///
     /// [`requires_ordering_by_descending_value_pwu`]: BnbMetric::requires_ordering_by_descending_value_pwu
     fn change_unavoidable(&mut self, cs: &CoinSelector<'_>) -> bool {
         if self.0.drain(cs).is_none() {
@@ -34,7 +38,7 @@ impl<M: BnbMetric> Changeless<M> {
         let mut least_excess = cs.clone();
         cs.unselected()
             .rev()
-            .take_while(|(_, wv)| wv.effective_value(cs.target().fee.rate) < 0.0)
+            .take_while(|&(index, _)| cs.effective_value_of(index, cs.target().fee.rate) < 0.0)
             .for_each(|(index, _)| {
                 least_excess.select(index);
             });

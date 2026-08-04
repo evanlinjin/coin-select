@@ -140,6 +140,10 @@ impl BnbMetric for LowestFee {
             // `drain_value`, where `change_value` is `excess_with_drain_weight` and `spend_fee` is
             // `drain_spend_cost`). With `v >= 0` the difference is strictly positive: B always
             // costs more.
+            //
+            // NOTE: the ancestor bump fee cancels between A and B because branch and bound
+            // searches on the per-candidate model, in which B's bump is A's plus the extra
+            // input's. See `Pricing` in `coin_selector.rs`.
             if self.drain_value(cs).is_none() {
                 // But a descendant might *add* a change output that improves the metric. This
                 // happens when the current selection is changeless only because the change would be
@@ -173,7 +177,16 @@ impl BnbMetric for LowestFee {
 
             Some(current_score)
         } else {
+            // The bumps the node itself has already committed to. Every descendant pays these, so
+            // they belong in the deficit below; the ones the greedy prefix adds on top do not,
+            // because a descendant may simply not select those candidates.
+            let committed_bump = cs.selected_ancestor_bump_fee(cs.target().fee.rate);
+
             // Step 1: select everything up until the input that hits the cs.target().
+            //
+            // NOTE: this prices a greedy *prefix* that descendants need not select. That is a
+            // lower bound only because the ancestor bump fee is additive here -- the prefix can
+            // charge for candidates a descendant skips, never the reverse. See `Pricing`.
             let (mut cs, resize_index, to_resize) =
                 cs.clone().select_iter().find(|(cs, _, _)| cs.is_funded())?;
 
@@ -182,6 +195,14 @@ impl BnbMetric for LowestFee {
                 return Some(self.fee_score(&cs).unwrap().0);
             };
             cs.deselect(resize_index);
+
+            // A bump is a fixed cost, not a rate, so scaling a hypothetical input cannot stand in
+            // for it -- and a descendant that skips the candidate skips the cost outright. Charge
+            // only what this node has already committed to, or the deficit is overstated and the
+            // bound stops being a lower bound.
+            let uncommitted_bump = cs
+                .selected_ancestor_bump_fee(cs.target().fee.rate)
+                .saturating_sub(committed_bump) as f32;
 
             // We need to find the minimum fee we'd pay if we satisfy the feerate constraint. We do
             // this by imagining we had a perfect input that perfectly hit the cs.target(). The sats per
@@ -200,11 +221,16 @@ impl BnbMetric for LowestFee {
             //
             // In the perfect scenario, no additional fee would be required to pay for rounding up when converting from weight units to
             // vbytes and so all fee calculations below are performed on weight units directly.
-            let rate_excess = cs.rate_excess_wu(Drain::NONE) as f32;
+            let rate_excess = cs.rate_excess_wu(Drain::NONE) as f32 + uncommitted_bump;
             let mut scale = Ordf32(0.0);
 
             if rate_excess < 0.0 {
                 let remaining_value_to_reach_feerate = rate_excess.abs();
+                // Deliberately `Candidate::effective_value` rather than the selector's: this
+                // prices a *hypothetical* input scaled to fit perfectly, and scaling an input does
+                // not scale the unconfirmed ancestors it drags in. A fixed cost in the denominator
+                // would inflate `scale`, which `ideal_fee` below multiplies by the raw value -- so
+                // the bound would exceed a real descendant's score and prune the optimum.
                 let effective_value_of_resized_input =
                     to_resize.effective_value(cs.target().fee.rate);
                 if effective_value_of_resized_input > 0.0 {
@@ -219,7 +245,8 @@ impl BnbMetric for LowestFee {
             // We can use the same approach for replacement we just have to use the
             // incremental_relay_feerate.
             if let Some(replace) = cs.target().fee.replace {
-                let replace_excess = cs.replacement_excess_wu(Drain::NONE) as f32;
+                let replace_excess =
+                    cs.replacement_excess_wu(Drain::NONE) as f32 + uncommitted_bump;
                 if replace_excess < 0.0 {
                     let remaining_value_to_reach_feerate = replace_excess.abs();
                     let effective_value_of_resized_input =
