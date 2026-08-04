@@ -53,7 +53,6 @@ proptest! {
         let wv = test_wv(&mut rng);
         let candidates = wv.take(n_candidates).collect::<Vec<_>>();
 
-        let cs = CoinSelector::new(&candidates);
 
         let target = Target {
             outputs: TargetOutputs {
@@ -68,6 +67,7 @@ proptest! {
             },
             max_weight: None,
         };
+        let cs = CoinSelector::new(&candidates, target);
 
         let make_metric = || {
             Changeless(LowestFee {
@@ -77,7 +77,7 @@ proptest! {
             })
         };
 
-        let solutions = cs.bnb_solutions(target, make_metric());
+        let solutions = cs.bnb_solutions(make_metric());
 
         println!("candidates: {:#?}", cs.candidates().collect::<Vec<_>>());
 
@@ -94,7 +94,7 @@ proptest! {
             None => {
                 let mut cs = cs.clone();
                 let mut metric = make_metric();
-                let has_solution = common::exhaustive_search(&mut cs, target, &mut metric).is_some();
+                let has_solution = common::exhaustive_search(&mut cs, &mut metric).is_some();
                 dbg!(format!("{}", cs));
                 assert!(!has_solution);
             }
