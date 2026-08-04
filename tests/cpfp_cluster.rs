@@ -1,6 +1,6 @@
 use bdk_coin_select::{
-    BumpTable, Candidate, Cluster, ClusterError, CoinSelector, FeeRate, MempoolTx, Target,
-    TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
+    Candidate, Cluster, ClusterError, CoinSelector, FeeRate, MempoolTx, Target, TargetFee,
+    TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
 };
 
 const RATE: f32 = 10.0;
@@ -41,14 +41,14 @@ fn tx(weight: u64, fee: u64, parents: Vec<usize>) -> MempoolTx {
     }
 }
 
-/// The bump a selection of `selection` owes under `table`.
-fn bump(table: &BumpTable, n_candidates: usize, selection: &[usize]) -> u64 {
+/// The bump a selection of `selection` owes under `cluster`, at the fixture target's feerate.
+fn bump(cluster: &Cluster, n_candidates: usize, selection: &[usize]) -> u64 {
     let candidates = candidates(n_candidates);
-    let mut cs = CoinSelector::new(&candidates, target()).with_bump_table(table);
+    let mut cs = CoinSelector::new(&candidates, target()).with_cluster(cluster);
     for &i in selection {
         cs.select(i);
     }
-    cs.selected_ancestor_bump_fee(rate())
+    cs.selected_ancestor_bump_fee()
 }
 
 /// A deficient parent with nothing to carry it has to be bumped, in full.
@@ -56,9 +56,8 @@ fn bump(table: &BumpTable, n_candidates: usize, selection: &[usize]) -> u64 {
 fn a_deficient_ancestor_alone_is_charged_in_full() {
     // 1000 wu = 250 vB. At 10 sat/vB it owes 2500 but paid 500.
     let cluster = Cluster::new(vec![tx(1_000, 500, vec![])], vec![(0, 0)]).unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
 
-    assert_eq!(bump(&table, 1, &[0]), 2_000);
+    assert_eq!(bump(&cluster, 1, &[0]), 2_000);
 }
 
 /// A deficient parent already carried by an overpaying child that we are *not* spending. A miner
@@ -77,9 +76,8 @@ fn a_parent_carried_by_someone_elses_child_needs_no_bump() {
     .unwrap();
 
     // Package {0,1} is 350 vB paying 4500 against 3500 owed, so a miner takes both.
-    let from_cluster = BumpTable::from_cluster(&cluster, rate());
     assert_eq!(
-        bump(&from_cluster, 1, &[0]),
+        bump(&cluster, 1, &[0]),
         0,
         "the child already pays for the parent"
     );
@@ -98,10 +96,9 @@ fn transitive_ancestors_are_pulled_in_automatically() {
         vec![(0, 2)],
     )
     .unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
 
     // All three are unmined: 1200 wu = 300 vB, owes 3000, paid 0.
-    assert_eq!(bump(&table, 1, &[0]), 3_000);
+    assert_eq!(bump(&cluster, 1, &[0]), 3_000);
 }
 
 /// A transaction shared by two selected candidates is paid for once.
@@ -116,13 +113,12 @@ fn a_shared_ancestor_is_charged_once() {
         vec![(0, 1), (1, 2)],
     )
     .unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
 
     // One candidate: parent + its own tx = 800 wu = 200 vB => 2000.
-    assert_eq!(bump(&table, 2, &[0]), 2_000);
-    assert_eq!(bump(&table, 2, &[1]), 2_000);
+    assert_eq!(bump(&cluster, 2, &[0]), 2_000);
+    assert_eq!(bump(&cluster, 2, &[1]), 2_000);
     // Both: parent counted once => 1200 wu = 300 vB => 3000, not 4000.
-    assert_eq!(bump(&table, 2, &[0, 1]), 3_000);
+    assert_eq!(bump(&cluster, 2, &[0, 1]), 3_000);
 }
 
 /// A cluster already paying above the target is mined entirely, so nothing is owed.
@@ -133,10 +129,13 @@ fn a_cluster_above_the_target_owes_nothing() {
         vec![(0, 1)],
     )
     .unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
 
-    assert_eq!(bump(&table, 1, &[0]), 0);
-    assert_eq!(bump(&table, 1, &[]), 0, "the empty subset always owes zero");
+    assert_eq!(bump(&cluster, 1, &[0]), 0);
+    assert_eq!(
+        bump(&cluster, 1, &[]),
+        0,
+        "the empty subset always owes zero"
+    );
 }
 
 /// Mining is package-wise, so a deficient parent is carried by an overpaying descendant we *are*
@@ -151,9 +150,8 @@ fn an_overpaying_descendant_carries_its_deficient_parent() {
         vec![(0, 1)], // we spend the child
     )
     .unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
 
-    assert_eq!(bump(&table, 1, &[0]), 0);
+    assert_eq!(bump(&cluster, 1, &[0]), 0);
 }
 
 #[test]
@@ -184,13 +182,12 @@ fn selecting_a_bump_neutral_candidate_does_not_move_the_price() {
         vec![(0, 0), (1, 1)],
     )
     .unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
 
     // Neutral candidate alone, and added on top of the stuck one: neither changes anything.
-    assert_eq!(bump(&table, 2, &[]), 0);
-    assert_eq!(bump(&table, 2, &[0]), 0);
-    assert_eq!(bump(&table, 2, &[1]), 990);
-    assert_eq!(bump(&table, 2, &[0, 1]), 990);
+    assert_eq!(bump(&cluster, 2, &[]), 0);
+    assert_eq!(bump(&cluster, 2, &[0]), 0);
+    assert_eq!(bump(&cluster, 2, &[1]), 990);
+    assert_eq!(bump(&cluster, 2, &[0, 1]), 990);
 }
 
 /// **The inequality the whole design rests on.** Branch and bound searches on the sum of
@@ -232,15 +229,14 @@ fn the_local_sum_never_undercuts_the_package_for_any_cluster() {
             .collect();
 
         let cluster = Cluster::new(txs, spends).expect("acyclic by construction");
-        let table = BumpTable::from_cluster(&cluster, rate());
         let cands = candidates(n_candidates);
-        let cs = CoinSelector::new(&cands, target()).with_bump_table(&table);
+        let cs = CoinSelector::new(&cands, target()).with_cluster(&cluster);
 
         for mask in 0..(1_u32 << n_candidates) {
             let selection: Vec<usize> =
                 (0..n_candidates).filter(|b| mask & (1 << b) != 0).collect();
             let local: u64 = selection.iter().map(|&i| cs.ancestor_bump_fee_of(i)).sum();
-            let combined = bump(&table, n_candidates, &selection);
+            let combined = bump(&cluster, n_candidates, &selection);
             assert!(
                 local >= combined,
                 "trial {}: local sum {} undercuts the package {} for selection {:?}",
@@ -269,7 +265,6 @@ fn branch_and_bound_selections_are_funded_when_priced_exactly() {
         vec![(0, 0), (1, 1), (2, 2)],
     )
     .unwrap();
-    let table = BumpTable::from_cluster(&cluster, rate());
     let cands = candidates(4);
 
     let target = Target {
@@ -287,7 +282,7 @@ fn branch_and_bound_selections_are_funded_when_priced_exactly() {
         drain_weights: DrainWeights::TR_KEYSPEND,
     };
 
-    let mut cs = CoinSelector::new(&cands, target).with_bump_table(&table);
+    let mut cs = CoinSelector::new(&cands, target).with_cluster(&cluster);
     let (_, drain) = cs.run_bnb(metric, 100_000).expect("a solution exists");
 
     assert!(

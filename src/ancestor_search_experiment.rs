@@ -40,8 +40,8 @@
 //! [`CoinSelector::effective_value_of`]: crate::CoinSelector::effective_value_of
 
 use crate::{
-    float::Ordf32, metrics::LowestFee, BnbMetric, BumpTable, Candidate, Cluster, CoinSelector,
-    DrainWeights, FeeRate, MempoolTx, Target, TargetFee, TargetOutputs,
+    float::Ordf32, metrics::LowestFee, BnbMetric, Candidate, Cluster, CoinSelector, DrainWeights,
+    FeeRate, MempoolTx, Target, TargetFee, TargetOutputs,
 };
 use alloc::vec::Vec;
 
@@ -63,7 +63,7 @@ impl Rng {
 
 struct Instance {
     candidates: Vec<Candidate>,
-    table: BumpTable,
+    cluster: Cluster,
     target: Target,
 }
 
@@ -126,11 +126,10 @@ fn instance(rng: &mut Rng, n: usize, k: usize, p_fine_pct: u64) -> Option<Instan
     }
 
     let cluster = Cluster::new(txs, spends).ok()?;
-    let table = BumpTable::from_cluster(&cluster, feerate);
 
     Some(Instance {
         candidates,
-        table,
+        cluster,
         target: Target {
             outputs: TargetOutputs {
                 value_sum: rng.in_range(100_000, 400_000),
@@ -145,7 +144,7 @@ fn instance(rng: &mut Rng, n: usize, k: usize, p_fine_pct: u64) -> Option<Instan
 
 /// An exactly-priced selector: what the caller sees, and what scores are compared on.
 fn exact<'a>(inst: &'a Instance) -> CoinSelector<'a> {
-    CoinSelector::new(&inst.candidates, inst.target).with_bump_table(&inst.table)
+    CoinSelector::new(&inst.candidates, inst.target).with_cluster(&inst.cluster)
 }
 
 /// The best exactly-priced score over every subset.
@@ -197,7 +196,7 @@ fn brute_force_allowing(inst: &Instance, allowed: &[usize]) -> Option<Ordf32> {
 /// it.
 fn selectable_under_ban(inst: &Instance) -> Vec<usize> {
     (0..inst.candidates.len())
-        .filter(|&c| inst.table.individual(c) == 0)
+        .filter(|&c| exact(inst).ancestor_bump_fee_of(c) == 0)
         .collect()
 }
 

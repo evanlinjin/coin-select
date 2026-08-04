@@ -18,8 +18,8 @@ pub struct MempoolTx {
 /// A connected piece of the mempool: the unconfirmed transactions relevant to a selection, and
 /// which candidates spend from which.
 ///
-/// This is the input to [`BumpTable`]. Supplying the graph rather than a flat ancestor list buys
-/// three things a list cannot express:
+/// This is the input to [`CoinSelector::with_cluster`]. Supplying the graph rather than a flat
+/// ancestor list buys three things a list cannot express:
 ///
 /// - **Transitive closure is computed here**, so a candidate cannot be under-priced by a caller
 ///   listing only its direct parent.
@@ -27,15 +27,14 @@ pub struct MempoolTx {
 ///   nothing, and an overpaying child that carries a deficient parent means neither is charged
 ///   for. A flat list has to charge for everything it is given.
 /// - **The bump stays safe to search on.** Branch and bound ranks candidates on their
-///   [individual] bumps, whose sum must never fall below what the package owes together. Mining
-///   guarantees that; pooling a flat list does not, because a shared ancestor that *overpays* has
-///   its surplus counted once per dependent.
+///   individual bumps ([`CoinSelector::ancestor_bump_fee_of`]), whose sum must never fall below
+///   what the package owes together. Mining guarantees that; pooling a flat list does not, because
+///   a shared ancestor that *overpays* has its surplus counted once per dependent.
 ///
 /// If all you have is a flat list of ancestors, express it here: each ancestor becomes a
 /// transaction with no parents, and each (ancestor, candidate) pair becomes an entry in
 /// `candidate_spends`. You then get the mining step for free.
 ///
-/// [individual]: crate::BumpTable::individual
 ///
 /// # Completeness
 ///
@@ -46,7 +45,8 @@ pub struct MempoolTx {
 /// the safe direction, and it is the reason this is an optimality limit rather than a correctness
 /// one.
 ///
-/// [`BumpTable`]: crate::BumpTable
+/// [`CoinSelector::with_cluster`]: crate::CoinSelector::with_cluster
+/// [`CoinSelector::ancestor_bump_fee_of`]: crate::CoinSelector::ancestor_bump_fee_of
 #[derive(Debug, Clone)]
 pub struct Cluster {
     txs: Vec<MempoolTx>,

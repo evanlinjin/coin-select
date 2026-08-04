@@ -14,7 +14,6 @@ extern crate std;
 mod bitset;
 pub use bitset::*;
 mod bump_table;
-pub use bump_table::*;
 mod mempool;
 pub use mempool::*;
 #[cfg(test)]

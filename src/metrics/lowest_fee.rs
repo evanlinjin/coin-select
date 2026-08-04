@@ -180,7 +180,7 @@ impl BnbMetric for LowestFee {
             // The bumps the node itself has already committed to. Every descendant pays these, so
             // they belong in the deficit below; the ones the greedy prefix adds on top do not,
             // because a descendant may simply not select those candidates.
-            let committed_bump = cs.selected_ancestor_bump_fee(cs.target().fee.rate);
+            let committed_bump = cs.selected_ancestor_bump_fee();
 
             // Step 1: select everything up until the input that hits the cs.target().
             //
@@ -201,11 +201,11 @@ impl BnbMetric for LowestFee {
             // only what this node has already committed to, or the deficit is overstated and the
             // bound stops being a lower bound.
             let uncommitted_bump = cs
-                .selected_ancestor_bump_fee(cs.target().fee.rate)
+                .selected_ancestor_bump_fee()
                 .saturating_sub(committed_bump) as f32;
 
             // We need to find the minimum fee we'd pay if we satisfy the feerate constraint. We do
-            // this by imagining we had a perfect input that perfectly hit the cs.target(). The sats per
+            // this by imagining we had a perfect input that perfectly hit the target. The sats per
             // weight unit of this perfect input is that of `to_resize` but we'll do a scaled
             // resize of it to fit perfectly.
             //

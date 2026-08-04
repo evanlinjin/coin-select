@@ -41,8 +41,10 @@ pub struct CoinSelector<'a> {
     /// built for one target and evaluated against it throughout, and threading it through every
     /// method made it possible to ask two different questions of the same selection.
     target: Target,
-    /// Exact CPFP pricing (via [`CoinSelector::with_bump_table`]).
-    bump_table: Option<&'a BumpTable>,
+    /// Exact CPFP pricing, built from the caller's [`Cluster`] at the target's feerate (via
+    /// [`CoinSelector::with_cluster`]). `Arc` because the selector is cloned at every branch and
+    /// bound node, and the table never changes after construction.
+    bump_table: Option<Arc<BumpTable>>,
     /// Which of the two ancestor-bump models this selector answers with. See [`Pricing`].
     pricing: Pricing,
     selected: Bitset,
@@ -83,21 +85,25 @@ impl<'a> CoinSelector<'a> {
         self.target
     }
 
-    /// Report CPFP package costs exactly, using `bump_table`.
+    /// Price CPFP packages exactly, for candidates that spend unconfirmed outputs of `cluster`.
+    ///
+    /// The pricing table is built here, at this selector's target feerate — the caller cannot
+    /// supply figures derived at some other rate, which would silently under-price the package.
+    /// This is why the method takes the raw [`Cluster`] rather than anything precomputed.
     ///
     /// Nothing is banned: candidates with unconfirmed ancestors are selected like any other. That
     /// works because the *search* reasons about [`effective_value_of`], which nets off each
-    /// candidate's individual bump and is therefore additive, while everything this selector reports —
-    /// [`excess`], [`implied_fee`], [`is_funded`], [`drain`] — uses the table's exact combined
+    /// candidate's individual bump and is therefore additive, while everything this selector
+    /// reports — [`excess`], [`implied_fee`], [`is_funded`], [`drain`] — uses the exact combined
     /// figure, in which an ancestor shared by two candidates is paid for once.
     ///
     /// The two differ, and deliberately: the sum of per-candidate bumps is never below the
     /// combined one, so the search *over*-reserves and the surplus surfaces as a larger change
-    /// output. See [`BumpTable`].
+    /// output rather than a missing fee.
     ///
     /// # Panics
     ///
-    /// If the table refers to a candidate index out of bounds for the slice passed to
+    /// If the cluster refers to a candidate index out of bounds for the slice passed to
     /// [`CoinSelector::new`].
     ///
     /// [`effective_value_of`]: Self::effective_value_of
@@ -105,16 +111,17 @@ impl<'a> CoinSelector<'a> {
     /// [`implied_fee`]: Self::implied_fee
     /// [`is_funded`]: Self::is_funded
     /// [`drain`]: Self::drain
-    pub fn with_bump_table(mut self, bump_table: &'a BumpTable) -> Self {
+    pub fn with_cluster(mut self, cluster: &Cluster) -> Self {
+        let bump_table = BumpTable::from_cluster(cluster, self.target.fee.rate);
         if let Some(max) = bump_table.max_candidate_index() {
             assert!(
                 max < self.candidates.len(),
-                "bump table refers to candidate index {} but there are only {} candidates",
+                "cluster refers to candidate index {} but there are only {} candidates",
                 max,
                 self.candidates.len()
             );
         }
-        self.bump_table = Some(bump_table);
+        self.bump_table = Some(Arc::new(bump_table));
         self
     }
 
@@ -145,7 +152,7 @@ impl<'a> CoinSelector<'a> {
     ///
     /// [ancestor bump fee]: Self::selected_ancestor_bump_fee
     pub fn candidates_with_ancestors(&self) -> impl Iterator<Item = usize> + '_ {
-        self.bump_table.into_iter().flat_map(|t| t.candidates())
+        self.bump_table.iter().flat_map(|t| t.candidates())
     }
 
     /// Iterate over all the candidates in their currently sorted order. Each item has the original
@@ -287,10 +294,10 @@ impl<'a> CoinSelector<'a> {
     }
 
     /// The extra fee this selection owes on top of its own weight, so that its unconfirmed
-    /// ancestors reach `feerate` as a package (CPFP).
+    /// ancestors reach the target feerate as a package (CPFP).
     ///
     /// Which of the two models answers depends on how this selector is priced. Everything a
-    /// caller can reach uses the **exact** figure — the [`BumpTable`]'s combined bump, in which an
+    /// caller can reach uses the **exact** figure — the combined package bump, in which an
     /// ancestor shared by two selected candidates is paid for once, and which is what the
     /// transaction actually owes.
     ///
@@ -298,26 +305,14 @@ impl<'a> CoinSelector<'a> {
     /// candidates' [`ancestor_bump_fee_of`] — additive, and therefore never below the exact one,
     /// so its ranking and bounds can rely on it.
     ///
-    /// Zero when neither a table nor per-candidate bumps were supplied.
-    ///
-    /// # Panics
-    ///
-    /// If `feerate` is not the one the table was built for. A table's figures are only valid at
-    /// its own feerate, and using them at another under-prices the package — in *both* directions,
-    /// so there is no safe side to land on. The check is one comparison and only runs when a table
-    /// is present, so it is not gated on debug builds.
+    /// Zero when no [`Cluster`] was supplied.
     ///
     /// [`ancestor_bump_fee_of`]: Self::ancestor_bump_fee_of
-    pub fn selected_ancestor_bump_fee(&self, feerate: FeeRate) -> u64 {
-        let bump_table = match self.bump_table {
+    pub fn selected_ancestor_bump_fee(&self) -> u64 {
+        let bump_table = match &self.bump_table {
             Some(bump_table) => bump_table,
             None => return 0,
         };
-        assert_eq!(
-            feerate,
-            bump_table.feerate(),
-            "bump table was built for a different feerate; its figures do not apply here"
-        );
         match self.pricing {
             Pricing::Local => self.selected.iter().map(|i| bump_table.individual(i)).sum(),
             Pricing::Exact => bump_table.combined(&self.selected),
@@ -325,30 +320,31 @@ impl<'a> CoinSelector<'a> {
     }
 
     /// What selecting the candidate at `index` alone would owe to bring its unconfirmed ancestors
-    /// up to the target feerate, in satoshis. Zero without a [`BumpTable`], or for a candidate
-    /// with no unconfirmed ancestors.
+    /// up to the target feerate, in satoshis. Zero without a [`Cluster`], or for a candidate with
+    /// no unconfirmed ancestors.
     ///
-    /// Additive across candidates, and never in total below what the package actually owes -- see
-    /// [`BumpTable`] for why that direction matters.
+    /// Additive across candidates, and never in total below what the package actually owes --
+    /// which is what makes it safe to search on; see [`with_cluster`](Self::with_cluster).
     pub fn ancestor_bump_fee_of(&self, index: usize) -> u64 {
-        self.bump_table.map_or(0, |t| t.individual(index))
+        self.bump_table.as_ref().map_or(0, |t| t.individual(index))
     }
 
     /// [`Candidate::effective_value`] less what that candidate's unconfirmed ancestors cost.
     ///
     /// This is the figure to rank candidates on. `Candidate` cannot compute it: a bump is only
     /// meaningful at the feerate it was derived for, and a `Candidate` has nowhere to record
-    /// which -- so it lives here, where the [`BumpTable`] is, and the feerate can be checked.
+    /// which -- so it lives here, where the target (and hence the feerate the bump was built at)
+    /// is known and can be checked.
     ///
     /// # Panics
     ///
-    /// If `feerate` is not the one the attached table was built for.
+    /// If a [`Cluster`] is attached and `feerate` is not the target's feerate — the bump is
+    /// computed at the target rate, and netting it off a differently-rated figure mixes rates.
     pub fn effective_value_of(&self, index: usize, feerate: FeeRate) -> f32 {
-        if let Some(bump_table) = self.bump_table {
+        if self.bump_table.is_some() {
             assert_eq!(
-                feerate,
-                bump_table.feerate(),
-                "bump table was built for a different feerate; its figures do not apply here"
+                feerate, self.target.fee.rate,
+                "the ancestor bump is computed at the target feerate; asking at another mixes rates"
             );
         }
         self.candidates[index].effective_value(feerate) - self.ancestor_bump_fee_of(index) as f32
@@ -472,7 +468,7 @@ impl<'a> CoinSelector<'a> {
             .fee
             .rate
             .implied_fee(self.weight(self.target.outputs, drain_weights))
-            + self.selected_ancestor_bump_fee(self.target.fee.rate)
+            + self.selected_ancestor_bump_fee()
     }
 
     /// Same as [`implied_package_fee_from_feerate`](Self::implied_package_fee_from_feerate) except `self.target.fee.rate`
@@ -482,7 +478,7 @@ impl<'a> CoinSelector<'a> {
             .fee
             .rate
             .implied_fee_wu(self.weight(self.target.outputs, drain_weights))
-            + self.selected_ancestor_bump_fee(self.target.fee.rate)
+            + self.selected_ancestor_bump_fee()
     }
 
     /// The fee needed for the whole CPFP package to satisfy RBF's rule 4, i.e. the replacement fee
@@ -497,7 +493,7 @@ impl<'a> CoinSelector<'a> {
             }
             None => 0,
         };
-        replacement_fee + self.selected_ancestor_bump_fee(self.target.fee.rate)
+        replacement_fee + self.selected_ancestor_bump_fee()
     }
 
     /// Same as [`implied_package_fee_from_replacement`](Self::implied_package_fee_from_replacement) except the
@@ -508,7 +504,7 @@ impl<'a> CoinSelector<'a> {
                 .min_fee_to_do_replacement_wu(self.weight(self.target.outputs, drain_weights)),
             None => 0,
         };
-        replacement_fee + self.selected_ancestor_bump_fee(self.target.fee.rate)
+        replacement_fee + self.selected_ancestor_bump_fee()
     }
 
     /// The actual fee the selection would pay if it was used in a transaction that had
@@ -521,10 +517,21 @@ impl<'a> CoinSelector<'a> {
 
     /// The value of the current selected inputs minus the fee needed to pay for the selected inputs
     /// and any ancestor bump fee.
+    ///
+    /// # Panics
+    ///
+    /// If a [`Cluster`] is attached and `feerate` is not the target's feerate; see
+    /// [`effective_value_of`](Self::effective_value_of).
     pub fn effective_value(&self, feerate: FeeRate) -> i64 {
+        if self.bump_table.is_some() {
+            assert_eq!(
+                feerate, self.target.fee.rate,
+                "the ancestor bump is computed at the target feerate; asking at another mixes rates"
+            );
+        }
         self.selected_value() as i64
             - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
-            - self.selected_ancestor_bump_fee(feerate) as i64
+            - self.selected_ancestor_bump_fee() as i64
     }
 
     // /// Waste sum of all selected inputs.
@@ -760,15 +767,7 @@ impl<'a> CoinSelector<'a> {
     ///
     /// A candidate if effective if it provides more value than it takes to pay for at `feerate`.
     pub fn select_all_effective(&mut self, feerate: FeeRate) {
-        // `Candidate::effective_value` subtracts a bump computed for the table's feerate, so
-        // ranking at any other one is meaningless. See `Candidate::ancestor_bump_fee`.
-        if let Some(bump_table) = self.bump_table {
-            assert_eq!(
-                feerate,
-                bump_table.feerate(),
-                "bump table was built for a different feerate; its figures do not apply here"
-            );
-        }
+        // `effective_value_of` asserts `feerate` matches the target when a cluster is attached.
         for i in 0..self.candidate_order.len() {
             let cand_index = self.candidate_order[i];
             if self.selected.contains(cand_index)

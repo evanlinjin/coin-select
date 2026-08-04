@@ -42,7 +42,7 @@ struct Unit {
 /// [`CoinSelector::selected_ancestor_bump_fee`]: crate::CoinSelector::selected_ancestor_bump_fee
 /// [`Target::fee`]: crate::Target::fee
 #[derive(Debug, Clone)]
-pub struct BumpTable {
+pub(crate) struct BumpTable {
     feerate: FeeRate,
     /// The unconfirmed transactions that may still need bumping: for a cluster, the ones a miner
     /// would leave behind; for a flat ancestor list, all of them.
@@ -65,7 +65,7 @@ impl BumpTable {
     ///
     /// The template is built once: which transactions a miner includes depends on the cluster and
     /// the feerate, not on which outputs you happen to be asking about.
-    pub fn from_cluster(cluster: &Cluster, feerate: FeeRate) -> Self {
+    pub(crate) fn from_cluster(cluster: &Cluster, feerate: FeeRate) -> Self {
         let mined = cluster.mine(feerate);
 
         // Renumber the survivors so units are dense and the mined transactions simply do not exist.
@@ -102,13 +102,8 @@ impl BumpTable {
         }
     }
 
-    /// The feerate these figures were computed for. They are meaningless at any other.
-    pub fn feerate(&self) -> FeeRate {
-        self.feerate
-    }
-
     /// The candidates that carry unconfirmed ancestors, ascending.
-    pub fn candidates(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn candidates(&self) -> impl Iterator<Item = usize> + '_ {
         self.entries.keys().copied()
     }
 
@@ -118,13 +113,8 @@ impl BumpTable {
     /// already include. Summing these across a selection over-estimates the combined package
     /// figure whenever ancestors are shared — and that over-estimate is the price of the figure
     /// being additive, which is what the selection algorithms need.
-    pub fn individual(&self, candidate: usize) -> u64 {
+    pub(crate) fn individual(&self, candidate: usize) -> u64 {
         self.entries.get(&candidate).map_or(0, |&(_, bump)| bump)
-    }
-
-    /// Every candidate's individual bump, ascending by candidate index.
-    pub fn individual_bumps(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.entries.iter().map(|(&c, &(_, bump))| (c, bump))
     }
 
     /// What the candidates in `selected` owe *together*, with shared ancestors counted once.

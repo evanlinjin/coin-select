@@ -1,6 +1,6 @@
 use bdk_coin_select::{
-    BumpTable, Candidate, Cluster, CoinSelector, Drain, DrainWeights, FeeRate, MempoolTx, Replace,
-    Target, TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
+    Candidate, Cluster, CoinSelector, Drain, DrainWeights, FeeRate, MempoolTx, Replace, Target,
+    TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
 };
 
 fn simple_target(feerate: f32) -> Target {
@@ -23,17 +23,14 @@ fn tx(weight: u64, fee: u64, parents: Vec<usize>) -> MempoolTx {
     }
 }
 
-/// Build a bump table at `feerate` sat/vB. A table is bound to one feerate, so asking about
-/// another needs a second table.
-fn table_at(txs: Vec<MempoolTx>, spends: Vec<(usize, usize)>, feerate: f32) -> BumpTable {
-    let cluster = Cluster::new(txs, spends).expect("well-formed");
-    BumpTable::from_cluster(&cluster, FeeRate::from_sat_per_vb(feerate))
+fn cluster(txs: Vec<MempoolTx>, spends: Vec<(usize, usize)>) -> Cluster {
+    Cluster::new(txs, spends).expect("well-formed")
 }
 
 /// One transaction paying far too little, spent by candidate 0: 400 wu = 100 vB, so at 10 sat/vB
 /// it owes 1000 but paid 10 => a 990 bump.
-fn one_stuck_parent(feerate: f32) -> BumpTable {
-    table_at(vec![tx(400, 10, vec![])], vec![(0, 0)], feerate)
+fn one_stuck_parent() -> Cluster {
+    cluster(vec![tx(400, 10, vec![])], vec![(0, 0)])
 }
 
 fn candidates(n: usize, value: u64) -> Vec<Candidate> {
@@ -60,10 +57,7 @@ fn zero_ancestors_backward_compatible() {
     let mut cs = CoinSelector::new(&candidates, simple_target(10.0));
     cs.select(0);
 
-    assert_eq!(
-        cs.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(10.0)),
-        0
-    );
+    assert_eq!(cs.selected_ancestor_bump_fee(), 0);
     assert!(
         cs.excess(Drain::NONE) > 0,
         "should meet target without ancestors"
@@ -72,8 +66,7 @@ fn zero_ancestors_backward_compatible() {
 
 #[test]
 fn single_ancestor_reduces_excess() {
-    let table = one_stuck_parent(10.0);
-    let feerate = FeeRate::from_sat_per_vb(10.0);
+    let cluster = one_stuck_parent();
     let target = simple_target(10.0);
 
     let plain = candidates(1, 200_000);
@@ -82,10 +75,10 @@ fn single_ancestor_reduces_excess() {
     let excess_no_anc = cs_no_anc.excess(Drain::NONE);
 
     let with_ancestors = priced(1, 200_000);
-    let mut cs = CoinSelector::new(&with_ancestors, target).with_bump_table(&table);
+    let mut cs = CoinSelector::new(&with_ancestors, target).with_cluster(&cluster);
     cs.select(0);
 
-    assert_eq!(cs.selected_ancestor_bump_fee(feerate), 990);
+    assert_eq!(cs.selected_ancestor_bump_fee(), 990);
     assert_eq!(
         excess_no_anc - cs.excess(Drain::NONE),
         990,
@@ -95,20 +88,19 @@ fn single_ancestor_reduces_excess() {
 
 #[test]
 fn shared_ancestors_are_deduplicated() {
-    let table = table_at(vec![tx(400, 10, vec![])], vec![(0, 0), (1, 0)], 10.0);
+    let cluster = cluster(vec![tx(400, 10, vec![])], vec![(0, 0), (1, 0)]);
     let candidates = priced(2, 100_000);
-    let feerate = FeeRate::from_sat_per_vb(10.0);
 
-    let mut cs_one = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let mut cs_one = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
     cs_one.select(0);
 
-    let mut cs_both = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let mut cs_both = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
     cs_both.select(0);
     cs_both.select(1);
 
     assert_eq!(
-        cs_one.selected_ancestor_bump_fee(feerate),
-        cs_both.selected_ancestor_bump_fee(feerate),
+        cs_one.selected_ancestor_bump_fee(),
+        cs_both.selected_ancestor_bump_fee(),
         "a shared ancestor is paid for once, however many dependents are selected"
     );
 }
@@ -117,17 +109,17 @@ fn shared_ancestors_are_deduplicated() {
 /// below the package figure the transaction pays — otherwise the search would under-reserve.
 #[test]
 fn the_local_sum_never_undercuts_the_package() {
-    let table = table_at(vec![tx(400, 10, vec![])], vec![(0, 0), (1, 0)], 10.0);
+    let cluster = cluster(vec![tx(400, 10, vec![])], vec![(0, 0), (1, 0)]);
     let candidates = priced(2, 100_000);
 
-    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
     cs.select(0);
     cs.select(1);
 
     let local: u64 = (0..candidates.len())
         .map(|i| cs.ancestor_bump_fee_of(i))
         .sum();
-    let combined = cs.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(10.0));
+    let combined = cs.selected_ancestor_bump_fee();
 
     assert_eq!(combined, 990, "the shared ancestor is charged once");
     assert_eq!(local, 1_980, "but each candidate is charged for it alone");
@@ -136,28 +128,25 @@ fn the_local_sum_never_undercuts_the_package() {
 
 #[test]
 fn ancestor_package_above_target_contributes_zero_bump() {
-    let table = table_at(vec![tx(400, 10_000, vec![])], vec![(0, 0)], 10.0);
+    let cluster = cluster(vec![tx(400, 10_000, vec![])], vec![(0, 0)]);
     let candidates = priced(1, 200_000);
 
-    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
     cs.select(0);
 
-    assert_eq!(
-        cs.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(10.0)),
-        0
-    );
+    assert_eq!(cs.selected_ancestor_bump_fee(), 0);
 }
 
-/// A table's figures are only valid at the feerate it was built for, so comparing feerates means
-/// building a table per feerate.
+/// The bump is priced at the selector's own target feerate — there is no separate rate to pass,
+/// and so no way to price the package at a rate other than the one being aimed for.
 #[test]
 fn different_feerates_produce_different_bump_fees() {
     let bump_at = |feerate: f32| {
-        let table = table_at(vec![tx(400, 100, vec![])], vec![(0, 0)], feerate);
+        let cluster = cluster(vec![tx(400, 100, vec![])], vec![(0, 0)]);
         let candidates = priced(1, 200_000);
-        let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+        let mut cs = CoinSelector::new(&candidates, simple_target(feerate)).with_cluster(&cluster);
         cs.select(0);
-        cs.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(feerate))
+        cs.selected_ancestor_bump_fee()
     };
 
     assert!(
@@ -166,31 +155,17 @@ fn different_feerates_produce_different_bump_fees() {
     );
 }
 
-/// A table built for one feerate silently under-prices the package at any other, so the mismatch
-/// is caught rather than tolerated.
-#[test]
-#[should_panic(expected = "bump table was built for a different feerate")]
-fn bump_table_rejects_a_mismatched_feerate() {
-    let table = one_stuck_parent(10.0);
-    let candidates = priced(1, 200_000);
-
-    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
-    cs.select(0);
-    cs.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(20.0));
-}
-
 /// The figure the selection algorithms rank on has to tell the whole truth about what a candidate
 /// costs. `Candidate` cannot supply it — a bump only means something at one feerate, and a
 /// `Candidate` has nowhere to record which — so it comes from the selector.
 #[test]
 fn the_selectors_effective_value_includes_the_bump() {
-    let table = one_stuck_parent(10.0);
+    let cluster = one_stuck_parent();
     let feerate = FeeRate::from_sat_per_vb(10.0);
     let candidates = candidates(1, 200_000);
 
     let plain = CoinSelector::new(&candidates, simple_target(10.0));
-    let with_ancestors =
-        CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let with_ancestors = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
 
     assert_eq!(with_ancestors.ancestor_bump_fee_of(0), 990);
     assert_eq!(plain.ancestor_bump_fee_of(0), 0, "no table, nothing owed");
@@ -211,14 +186,14 @@ fn the_selectors_effective_value_includes_the_bump() {
 /// wallet sizing its change output from it would otherwise underpay the package.
 #[test]
 fn implied_fee_includes_ancestor_bump() {
-    let table = one_stuck_parent(10.0);
+    let cluster = one_stuck_parent();
     let target = simple_target(10.0);
     let plain = candidates(1, 200_000);
     let with_ancestors = priced(1, 200_000);
 
     let mut without = CoinSelector::new(&plain, target);
     without.select(0);
-    let mut with = CoinSelector::new(&with_ancestors, target).with_bump_table(&table);
+    let mut with = CoinSelector::new(&with_ancestors, target).with_cluster(&cluster);
     with.select(0);
 
     assert_eq!(
@@ -232,9 +207,9 @@ fn implied_fee_includes_ancestor_bump() {
 /// algorithms like any other, because its cost is visible in the figures they rank on.
 #[test]
 fn ancestor_candidates_are_selectable() {
-    let table = one_stuck_parent(10.0);
+    let cluster = one_stuck_parent();
     let candidates = priced(1, 200_000);
-    let cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let cs = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
 
     assert!(cs.banned().is_empty(), "nothing is banned any more");
     assert_eq!(cs.unselected_indices().collect::<Vec<_>>(), vec![0]);
@@ -245,10 +220,7 @@ fn ancestor_candidates_are_selectable() {
         .select_until_target_met()
         .expect("the ancestor candidate covers the target even after its bump");
     assert!(greedy.is_selected(0));
-    assert_eq!(
-        greedy.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(10.0)),
-        990
-    );
+    assert_eq!(greedy.selected_ancestor_bump_fee(), 990);
 }
 
 /// `excess == selected_value - target.value() - drain.value - implied_fee` must hold for every
@@ -272,8 +244,7 @@ fn excess_and_implied_fee_agree() {
         for absolute in [0_u64, 5_000, 500_000] {
             for replace in [None, Some(Replace::new(1_000))] {
                 for feerate in [1.0_f32, 10.0, 50.0] {
-                    // A table is bound to one feerate, so it belongs inside this loop.
-                    let table = table_at(txs.clone(), spends.clone(), feerate);
+                    let cluster = cluster(txs.clone(), spends.clone());
                     let mut candidates = candidates(2, 200_000);
                     candidates[1].value = 50_000;
 
@@ -300,7 +271,7 @@ fn excess_and_implied_fee_agree() {
 
                         for selection in [vec![], vec![0], vec![1], vec![0, 1]] {
                             let mut cs =
-                                CoinSelector::new(&candidates, target).with_bump_table(&table);
+                                CoinSelector::new(&candidates, target).with_cluster(&cluster);
                             for i in &selection {
                                 cs.select(*i);
                             }
@@ -328,32 +299,27 @@ fn excess_and_implied_fee_agree() {
     }
 }
 
-/// `Candidate::ancestor_bump_fee` is `feerate * weight - fee_paid` over the unconfirmed ancestors,
-/// so it only means anything at the feerate it was computed for — and `Candidate` has nowhere to
-/// record which. Every path that reaches it through a selector carrying a table is checked;
-/// `select_all_effective` is the one that takes a feerate of its own.
+/// The bump is computed at the target feerate, so per-candidate figures asked at any other rate
+/// would mix rates. The methods that take a feerate of their own catch that.
 #[test]
-#[should_panic(expected = "bump table was built for a different feerate")]
+#[should_panic(expected = "the ancestor bump is computed at the target feerate")]
 fn selecting_all_effective_rejects_a_mismatched_feerate() {
-    let table = one_stuck_parent(10.0);
+    let cluster = one_stuck_parent();
     let candidates = priced(1, 200_000);
 
-    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
     cs.select_all_effective(FeeRate::from_sat_per_vb(20.0));
 }
 
-/// The same figures at the table's own feerate are fine, and the bump is visible in the ranking.
+/// The same figures at the target's own feerate are fine, and the bump is visible in the ranking.
 #[test]
-fn selecting_all_effective_works_at_the_table_feerate() {
-    let table = one_stuck_parent(10.0);
+fn selecting_all_effective_works_at_the_target_feerate() {
+    let cluster = one_stuck_parent();
     let candidates = priced(1, 200_000);
 
-    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_bump_table(&table);
+    let mut cs = CoinSelector::new(&candidates, simple_target(10.0)).with_cluster(&cluster);
     cs.select_all_effective(FeeRate::from_sat_per_vb(10.0));
 
     assert!(cs.is_selected(0), "still worth its bump at 200_000 sats");
-    assert_eq!(
-        cs.selected_ancestor_bump_fee(FeeRate::from_sat_per_vb(10.0)),
-        990
-    );
+    assert_eq!(cs.selected_ancestor_bump_fee(), 990);
 }
