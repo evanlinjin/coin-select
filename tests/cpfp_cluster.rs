@@ -1,5 +1,5 @@
 use bdk_coin_select::{
-    Candidate, Cluster, ClusterError, CoinSelector, FeeRate, MempoolTx, Target, TargetFee,
+    Candidate, Cluster, ClusterBuilder, ClusterError, CoinSelector, FeeRate, Target, TargetFee,
     TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
 };
 
@@ -33,12 +33,22 @@ fn target() -> Target {
     }
 }
 
-fn tx(weight: u64, fee: u64, parents: Vec<usize>) -> MempoolTx {
-    MempoolTx {
-        weight,
-        fee,
-        parents,
+/// (weight, fee, parent positions) — fed to the builder with the position as the id.
+type Tx = (u64, u64, Vec<usize>);
+
+fn tx(weight: u64, fee: u64, parents: Vec<usize>) -> Tx {
+    (weight, fee, parents)
+}
+
+fn try_cluster(txs: Vec<Tx>, spends: Vec<(usize, usize)>) -> Result<Cluster, ClusterError<usize>> {
+    let mut builder = ClusterBuilder::new();
+    for (id, (weight, fee, parents)) in txs.into_iter().enumerate() {
+        builder.tx(id, weight, fee, parents);
     }
+    for (candidate, tx_id) in spends {
+        builder.spent_by(tx_id, candidate);
+    }
+    builder.build()
 }
 
 /// The bump a selection of `selection` owes under `cluster`, at the fixture target's feerate.
@@ -55,7 +65,7 @@ fn bump(cluster: &Cluster, n_candidates: usize, selection: &[usize]) -> u64 {
 #[test]
 fn a_deficient_ancestor_alone_is_charged_in_full() {
     // 1000 wu = 250 vB. At 10 sat/vB it owes 2500 but paid 500.
-    let cluster = Cluster::new(vec![tx(1_000, 500, vec![])], vec![(0, 0)]).unwrap();
+    let cluster = try_cluster(vec![tx(1_000, 500, vec![])], vec![(0, 0)]).unwrap();
 
     assert_eq!(bump(&cluster, 1, &[0]), 2_000);
 }
@@ -65,7 +75,7 @@ fn a_deficient_ancestor_alone_is_charged_in_full() {
 /// is nowhere in this candidate's ancestry.
 #[test]
 fn a_parent_carried_by_someone_elses_child_needs_no_bump() {
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![
             tx(1_000, 500, vec![]),  // 0: parent, 250 vB, owes 2500, paid 500
             tx(400, 4_000, vec![0]), // 1: its child, 100 vB, pays 4000
@@ -87,7 +97,7 @@ fn a_parent_carried_by_someone_elses_child_needs_no_bump() {
 /// grandparent without the caller having to say so.
 #[test]
 fn transitive_ancestors_are_pulled_in_automatically() {
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![
             tx(400, 0, vec![]),  // 0: grandparent, 100 vB, pays nothing
             tx(400, 0, vec![0]), // 1: parent
@@ -104,7 +114,7 @@ fn transitive_ancestors_are_pulled_in_automatically() {
 /// A transaction shared by two selected candidates is paid for once.
 #[test]
 fn a_shared_ancestor_is_charged_once() {
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![
             tx(400, 0, vec![]),  // 0: shared parent
             tx(400, 0, vec![0]), // 1: spent by candidate 0
@@ -124,7 +134,7 @@ fn a_shared_ancestor_is_charged_once() {
 /// A cluster already paying above the target is mined entirely, so nothing is owed.
 #[test]
 fn a_cluster_above_the_target_owes_nothing() {
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![tx(400, 10_000, vec![]), tx(400, 10_000, vec![0])],
         vec![(0, 1)],
     )
@@ -142,7 +152,7 @@ fn a_cluster_above_the_target_owes_nothing() {
 /// spending — the whole chain comes in together or not at all.
 #[test]
 fn an_overpaying_descendant_carries_its_deficient_parent() {
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![
             tx(1_000, 500, vec![]),  // 250 vB, owes 2500, paid 500
             tx(400, 4_000, vec![0]), // 100 vB, pays 4000
@@ -157,27 +167,52 @@ fn an_overpaying_descendant_carries_its_deficient_parent() {
 #[test]
 fn cluster_rejects_malformed_input() {
     assert_eq!(
-        Cluster::new(vec![tx(400, 0, vec![7])], vec![]).unwrap_err(),
-        ClusterError::ParentOutOfBounds { tx: 0, parent: 7 }
+        try_cluster(vec![tx(400, 0, vec![7])], vec![]).unwrap_err(),
+        ClusterError::UnknownParent {
+            child: 0,
+            parent: 7
+        }
     );
     assert_eq!(
-        Cluster::new(vec![tx(400, 0, vec![])], vec![(0, 3)]).unwrap_err(),
-        ClusterError::SpendOutOfBounds {
+        try_cluster(vec![tx(400, 0, vec![])], vec![(0, 3)]).unwrap_err(),
+        ClusterError::UnknownSpend {
             candidate: 0,
             tx: 3
         }
     );
     assert!(matches!(
-        Cluster::new(vec![tx(400, 0, vec![1]), tx(400, 0, vec![0])], vec![(0, 0)]),
+        try_cluster(vec![tx(400, 0, vec![1]), tx(400, 0, vec![0])], vec![(0, 0)]),
         Err(ClusterError::Cycle { .. })
     ));
+
+    let mut duplicated = ClusterBuilder::new();
+    duplicated.tx("a", 400, 0, []);
+    duplicated.tx("a", 500, 0, []);
+    assert_eq!(
+        duplicated.build().unwrap_err(),
+        ClusterError::DuplicateTx { tx: "a" }
+    );
+}
+
+/// The builder is keyed by the caller's own ids — insertion order does not matter, a child may
+/// name a parent that arrives later, and errors come back in the caller's vocabulary.
+#[test]
+fn builder_accepts_ids_in_any_order() {
+    let mut builder = ClusterBuilder::new();
+    builder.tx("child", 400, 4_000, ["parent"]); // parent not added yet
+    builder.tx("parent", 1_000, 500, []);
+    builder.spent_by("child", 0);
+    let cluster = builder.build().expect("well-formed");
+
+    // Package {parent, child}: 350 vB paying 4500 against 3500 owed => mined, nothing to bump.
+    assert_eq!(bump(&cluster, 1, &[0]), 0);
 }
 
 /// Selecting a bump-neutral candidate really does leave the package price alone -- which is the
 /// property that makes leaving it unbanned safe.
 #[test]
 fn selecting_a_bump_neutral_candidate_does_not_move_the_price() {
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![tx(400, 2_000, vec![]), tx(400, 10, vec![])],
         vec![(0, 0), (1, 1)],
     )
@@ -228,7 +263,7 @@ fn the_local_sum_never_undercuts_the_package_for_any_cluster() {
             .map(|c| (c, (next() % n_txs as u64) as usize))
             .collect();
 
-        let cluster = Cluster::new(txs, spends).expect("acyclic by construction");
+        let cluster = try_cluster(txs, spends).expect("acyclic by construction");
         let cands = candidates(n_candidates);
         let cs = CoinSelector::new(&cands, target()).with_cluster(&cluster);
 
@@ -256,7 +291,7 @@ fn the_local_sum_never_undercuts_the_package_for_any_cluster() {
 fn branch_and_bound_selections_are_funded_when_priced_exactly() {
     use bdk_coin_select::{metrics::LowestFee, DrainWeights, Target, TargetFee, TargetOutputs};
 
-    let cluster = Cluster::new(
+    let cluster = try_cluster(
         vec![
             tx(1_000, 500, vec![]), // stuck parent, shared by candidates 0 and 1
             tx(400, 10, vec![0]),   // stuck child

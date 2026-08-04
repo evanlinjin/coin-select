@@ -1,6 +1,6 @@
 use bdk_coin_select::{
-    Candidate, Cluster, CoinSelector, Drain, DrainWeights, FeeRate, MempoolTx, Replace, Target,
-    TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
+    Candidate, Cluster, ClusterBuilder, CoinSelector, Drain, DrainWeights, FeeRate, Replace,
+    Target, TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT,
 };
 
 fn simple_target(feerate: f32) -> Target {
@@ -15,16 +15,22 @@ fn simple_target(feerate: f32) -> Target {
     }
 }
 
-fn tx(weight: u64, fee: u64, parents: Vec<usize>) -> MempoolTx {
-    MempoolTx {
-        weight,
-        fee,
-        parents,
-    }
+/// (weight, fee, parent positions) — fed to the builder with the position as the id.
+type Tx = (u64, u64, Vec<usize>);
+
+fn tx(weight: u64, fee: u64, parents: Vec<usize>) -> Tx {
+    (weight, fee, parents)
 }
 
-fn cluster(txs: Vec<MempoolTx>, spends: Vec<(usize, usize)>) -> Cluster {
-    Cluster::new(txs, spends).expect("well-formed")
+fn cluster(txs: Vec<Tx>, spends: Vec<(usize, usize)>) -> Cluster {
+    let mut builder = ClusterBuilder::new();
+    for (id, (weight, fee, parents)) in txs.into_iter().enumerate() {
+        builder.tx(id, weight, fee, parents);
+    }
+    for (candidate, tx_id) in spends {
+        builder.spent_by(tx_id, candidate);
+    }
+    builder.build().expect("well-formed")
 }
 
 /// One transaction paying far too little, spent by candidate 0: 400 wu = 100 vB, so at 10 sat/vB
@@ -230,7 +236,7 @@ fn ancestor_candidates_are_selectable() {
 fn excess_and_implied_fee_agree() {
     // (transactions, which candidate spends which) -- no ancestors, one stuck parent, and a stuck
     // parent for candidate 0 alongside an already-paying one for candidate 1.
-    type Fixture = (Vec<MempoolTx>, Vec<(usize, usize)>);
+    type Fixture = (Vec<Tx>, Vec<(usize, usize)>);
     let clusters: [Fixture; 3] = [
         (vec![], vec![]),
         (vec![tx(400, 10, vec![])], vec![(0, 0)]),

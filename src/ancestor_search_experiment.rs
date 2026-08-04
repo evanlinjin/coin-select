@@ -40,8 +40,8 @@
 //! [`CoinSelector::effective_value_of`]: crate::CoinSelector::effective_value_of
 
 use crate::{
-    float::Ordf32, metrics::LowestFee, BnbMetric, Candidate, Cluster, CoinSelector, DrainWeights,
-    FeeRate, MempoolTx, Target, TargetFee, TargetOutputs,
+    float::Ordf32, metrics::LowestFee, BnbMetric, Candidate, Cluster, ClusterBuilder, CoinSelector,
+    DrainWeights, FeeRate, Target, TargetFee, TargetOutputs,
 };
 use alloc::vec::Vec;
 
@@ -89,26 +89,24 @@ fn instance(rng: &mut Rng, n: usize, k: usize, p_fine_pct: u64) -> Option<Instan
         })
         .collect::<Vec<_>>();
 
-    let mut txs: Vec<MempoolTx> = Vec::new();
+    // (weight, fee, parent positions); position doubles as the builder id.
+    let mut txs: Vec<(u64, u64, Vec<usize>)> = Vec::new();
     let mut spends: Vec<(usize, usize)> = Vec::new();
 
-    let push_tx = |txs: &mut Vec<MempoolTx>, rng: &mut Rng, parents: Vec<usize>| -> usize {
-        let weight = rng.in_range(400, 1_600) / 4 * 4;
-        // Fee as a multiple of what the cs.target() feerate would require: "fine" parents pay 1.0-3.0x
-        // and get mined, "stuck" ones pay 0.05-0.8x and need bumping.
-        let mult_pct = if rng.in_range(0, 100) < p_fine_pct {
-            rng.in_range(100, 300)
-        } else {
-            rng.in_range(5, 80)
+    let push_tx =
+        |txs: &mut Vec<(u64, u64, Vec<usize>)>, rng: &mut Rng, parents: Vec<usize>| -> usize {
+            let weight = rng.in_range(400, 1_600) / 4 * 4;
+            // Fee as a multiple of what the cs.target() feerate would require: "fine" parents pay 1.0-3.0x
+            // and get mined, "stuck" ones pay 0.05-0.8x and need bumping.
+            let mult_pct = if rng.in_range(0, 100) < p_fine_pct {
+                rng.in_range(100, 300)
+            } else {
+                rng.in_range(5, 80)
+            };
+            let fee = (weight / 4) * 10 * mult_pct / 100;
+            txs.push((weight, fee, parents));
+            txs.len() - 1
         };
-        let fee = (weight / 4) * 10 * mult_pct / 100;
-        txs.push(MempoolTx {
-            weight,
-            fee,
-            parents,
-        });
-        txs.len() - 1
-    };
 
     for c in 0..k {
         let tx = match c {
@@ -125,7 +123,16 @@ fn instance(rng: &mut Rng, n: usize, k: usize, p_fine_pct: u64) -> Option<Instan
         spends.push((c, tx));
     }
 
-    let cluster = Cluster::new(txs, spends).ok()?;
+    let cluster = {
+        let mut builder = ClusterBuilder::new();
+        for (id, (weight, fee, parents)) in txs.into_iter().enumerate() {
+            builder.tx(id, weight, fee, parents);
+        }
+        for (candidate, tx_id) in spends {
+            builder.spent_by(tx_id, candidate);
+        }
+        builder.build().ok()?
+    };
 
     Some(Instance {
         candidates,

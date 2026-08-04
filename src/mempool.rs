@@ -1,22 +1,144 @@
 use crate::{bitset::Bitset, FeeRate};
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 
-/// An unconfirmed transaction in a [`Cluster`].
+/// An unconfirmed transaction, stripped to what pricing needs. Parents are indices into the
+/// cluster's transaction list; the id-to-index resolution happened in [`ClusterBuilder::build`].
 #[derive(Debug, Clone)]
-pub struct MempoolTx {
-    /// Weight in weight units.
-    pub weight: u64,
-    /// Fee paid, in satoshis.
-    pub fee: u64,
-    /// Indices into [`Cluster`]'s transaction list of this transaction's *direct* parents.
+pub(crate) struct MempoolTx {
+    pub(crate) weight: u64,
+    pub(crate) fee: u64,
+    /// *Direct* parents only; transitive closures are computed from these.
+    pub(crate) parents: Vec<usize>,
+}
+
+/// Builds a [`Cluster`] from transactions keyed by the caller's own ids.
+///
+/// `Id` is whatever the caller already keys transactions by — a txid, a `[u8; 32]`, anything
+/// `Ord + Clone`. This crate deliberately has no `bitcoin` dependency, so it never names a txid
+/// type; it just resolves the ids to internal indices once, in [`build`](Self::build).
+/// Transactions may be added in any order: a child may name a parent that has not been added yet,
+/// as long as it is there by `build` time.
+///
+/// ```
+/// # use bdk_coin_select::ClusterBuilder;
+/// let mut builder = ClusterBuilder::new();
+/// builder.tx("a", 1_000, 500, []); // id, weight (wu), fee paid (sats), parents
+/// builder.tx("b", 400, 0, ["a"]);
+/// builder.spent_by("b", 3); // candidate 3 spends an output of "b"
+/// let cluster = builder.build().expect("well-formed");
+/// ```
+#[derive(Debug, Clone)]
+pub struct ClusterBuilder<Id> {
+    /// (id, weight, fee, parent ids), in insertion order.
+    txs: Vec<(Id, u64, u64, Vec<Id>)>,
+    /// (candidate index, tx id).
+    spends: Vec<(usize, Id)>,
+}
+
+impl<Id> Default for ClusterBuilder<Id> {
+    fn default() -> Self {
+        Self {
+            txs: Vec::new(),
+            spends: Vec::new(),
+        }
+    }
+}
+
+impl<Id: Ord + Clone> ClusterBuilder<Id> {
+    /// A builder with no transactions. Building it yields an empty cluster, which prices every
+    /// candidate as ancestor-free.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an unconfirmed transaction: its `weight` in weight units, the `fee` it already pays
+    /// in satoshis, and the ids of its *direct* in-cluster parents — transitive ancestors are
+    /// derived, which is much of the point of supplying a graph rather than a list. Parents
+    /// need not have been added yet.
+    pub fn tx(&mut self, id: Id, weight: u64, fee: u64, parents: impl IntoIterator<Item = Id>) {
+        self.txs
+            .push((id, weight, fee, parents.into_iter().collect()));
+    }
+
+    /// Record that the candidate at `candidate_index` (into the slice given to
+    /// [`CoinSelector::new`]) spends an output of the transaction `id`.
     ///
-    /// Only *direct* parents: the transitive closure is computed for you, which is much of the
-    /// point of supplying a graph rather than a list.
-    pub parents: Vec<usize>,
+    /// Both directions are many: a transaction may be spent by several candidates, and a candidate
+    /// may appear more than once when it spends outputs of several transactions — its package is
+    /// then the union of their ancestor closures.
+    ///
+    /// [`CoinSelector::new`]: crate::CoinSelector::new
+    pub fn spent_by(&mut self, id: Id, candidate_index: usize) {
+        self.spends.push((candidate_index, id));
+    }
+
+    /// Resolve ids and compute ancestor closures.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`], naming the offending ids: a duplicated transaction, a parent or spent
+    /// transaction that was never added, or a cycle in the parent relation (real mempool graphs
+    /// are acyclic; an id scheme that cycles is a caller bug).
+    pub fn build(self) -> Result<Cluster, ClusterError<Id>> {
+        let mut index_of = BTreeMap::new();
+        for (index, (id, _, _, _)) in self.txs.iter().enumerate() {
+            if index_of.insert(id.clone(), index).is_some() {
+                return Err(ClusterError::DuplicateTx { tx: id.clone() });
+            }
+        }
+
+        let txs =
+            self.txs
+                .iter()
+                .map(|(id, weight, fee, parents)| {
+                    let parents = parents
+                        .iter()
+                        .map(|parent| {
+                            index_of.get(parent).copied().ok_or_else(|| {
+                                ClusterError::UnknownParent {
+                                    child: id.clone(),
+                                    parent: parent.clone(),
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(MempoolTx {
+                        weight: *weight,
+                        fee: *fee,
+                        parents,
+                    })
+                })
+                .collect::<Result<Vec<_>, ClusterError<Id>>>()?;
+
+        let candidate_spends = self
+            .spends
+            .iter()
+            .map(|(candidate, id)| {
+                let tx = index_of
+                    .get(id)
+                    .copied()
+                    .ok_or_else(|| ClusterError::UnknownSpend {
+                        candidate: *candidate,
+                        tx: id.clone(),
+                    })?;
+                Ok((*candidate, tx))
+            })
+            .collect::<Result<Vec<_>, ClusterError<Id>>>()?;
+
+        let closures = ancestor_closures(&txs).map_err(|index| ClusterError::Cycle {
+            tx: self.txs[index].0.clone(),
+        })?;
+
+        Ok(Cluster {
+            txs,
+            candidate_spends,
+            closures,
+        })
+    }
 }
 
 /// A connected piece of the mempool: the unconfirmed transactions relevant to a selection, and
-/// which candidates spend from which.
+/// which candidates spend from which. Built with [`ClusterBuilder`].
 ///
 /// This is the input to [`CoinSelector::with_cluster`]. Supplying the graph rather than a flat
 /// ancestor list buys three things a list cannot express:
@@ -30,11 +152,6 @@ pub struct MempoolTx {
 ///   individual bumps ([`CoinSelector::ancestor_bump_fee_of`]), whose sum must never fall below
 ///   what the package owes together. Mining guarantees that; pooling a flat list does not, because
 ///   a shared ancestor that *overpays* has its surplus counted once per dependent.
-///
-/// If all you have is a flat list of ancestors, express it here: each ancestor becomes a
-/// transaction with no parents, and each (ancestor, candidate) pair becomes an entry in
-/// `candidate_spends`. You then get the mining step for free.
-///
 ///
 /// # Completeness
 ///
@@ -56,96 +173,64 @@ pub struct Cluster {
     closures: Vec<Bitset>,
 }
 
-/// Error returned when a [`Cluster`] cannot be built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClusterError {
-    /// A `parents` entry does not refer to a transaction in the cluster.
-    ParentOutOfBounds {
-        /// The transaction naming the bad parent.
-        tx: usize,
-        /// The out-of-bounds parent index.
-        parent: usize,
+/// Error returned by [`ClusterBuilder::build`], naming the offending transactions by the caller's
+/// own ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterError<Id> {
+    /// The same transaction id was added twice.
+    DuplicateTx {
+        /// The duplicated id.
+        tx: Id,
     },
-    /// A `candidate_spends` entry does not refer to a transaction in the cluster.
-    SpendOutOfBounds {
+    /// A transaction names a parent that was never added.
+    UnknownParent {
+        /// The transaction naming the missing parent.
+        child: Id,
+        /// The missing parent.
+        parent: Id,
+    },
+    /// A candidate spends a transaction that was never added.
+    UnknownSpend {
         /// The candidate index.
         candidate: usize,
-        /// The out-of-bounds transaction index.
-        tx: usize,
+        /// The missing transaction.
+        tx: Id,
     },
     /// The parent relation contains a cycle, so the transactions cannot all be ancestors of each
     /// other. Real mempool clusters are acyclic.
     Cycle {
         /// A transaction on the cycle.
-        tx: usize,
+        tx: Id,
     },
 }
 
-impl core::fmt::Display for ClusterError {
+impl<Id: core::fmt::Debug> core::fmt::Display for ClusterError<Id> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            ClusterError::ParentOutOfBounds { tx, parent } => write!(
+            ClusterError::DuplicateTx { tx } => {
+                write!(f, "transaction {:?} was added more than once", tx)
+            }
+            ClusterError::UnknownParent { child, parent } => write!(
                 f,
-                "transaction {} names parent {}, which is not in the cluster",
-                tx, parent
+                "transaction {:?} names parent {:?}, which is not in the cluster",
+                child, parent
             ),
-            ClusterError::SpendOutOfBounds { candidate, tx } => write!(
+            ClusterError::UnknownSpend { candidate, tx } => write!(
                 f,
-                "candidate {} spends transaction {}, which is not in the cluster",
+                "candidate {} spends transaction {:?}, which is not in the cluster",
                 candidate, tx
             ),
             ClusterError::Cycle { tx } => {
-                write!(f, "the parent relation cycles through transaction {}", tx)
+                write!(f, "the parent relation cycles through transaction {:?}", tx)
             }
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for ClusterError {}
+impl<Id: core::fmt::Debug> std::error::Error for ClusterError<Id> {}
 
 impl Cluster {
-    /// Build a cluster from unconfirmed transactions and the candidates that spend them.
-    ///
-    /// `candidate_spends` pairs a candidate index (into the slice given to
-    /// [`CoinSelector::new`]) with the index of the transaction in `txs` whose output it spends.
-    /// Both directions are many: a transaction may be spent by several candidates, and a candidate
-    /// may appear more than once when it spends outputs of several transactions — its package is
-    /// then the union of their ancestor closures.
-    ///
-    /// # Errors
-    ///
-    /// [`ClusterError`] if an index is out of bounds or the parent relation cycles.
-    ///
-    /// [`CoinSelector::new`]: crate::CoinSelector::new
-    pub fn new(
-        txs: Vec<MempoolTx>,
-        candidate_spends: Vec<(usize, usize)>,
-    ) -> Result<Self, ClusterError> {
-        for (tx_index, tx) in txs.iter().enumerate() {
-            for &parent in &tx.parents {
-                if parent >= txs.len() {
-                    return Err(ClusterError::ParentOutOfBounds {
-                        tx: tx_index,
-                        parent,
-                    });
-                }
-            }
-        }
-        for &(candidate, tx) in &candidate_spends {
-            if tx >= txs.len() {
-                return Err(ClusterError::SpendOutOfBounds { candidate, tx });
-            }
-        }
-
-        let closures = ancestor_closures(&txs)?;
-        Ok(Self {
-            txs,
-            candidate_spends,
-            closures,
-        })
-    }
-
     /// The candidates that spend from this cluster, ascending and deduplicated.
     pub fn candidates(&self) -> Vec<usize> {
         let mut out = self
@@ -246,8 +331,9 @@ impl Cluster {
     }
 }
 
-/// For each transaction, the set containing it and all its transitive ancestors.
-fn ancestor_closures(txs: &[MempoolTx]) -> Result<Vec<Bitset>, ClusterError> {
+/// For each transaction, the set containing it and all its transitive ancestors. `Err` carries the
+/// index of a transaction on a cycle.
+fn ancestor_closures(txs: &[MempoolTx]) -> Result<Vec<Bitset>, usize> {
     let n = txs.len();
     let mut closures = Vec::with_capacity(n);
     for _ in 0..n {
@@ -272,7 +358,7 @@ fn ancestor_closures(txs: &[MempoolTx]) -> Result<Vec<Bitset>, ClusterError> {
                 let parent = txs[tx].parents[*next_parent];
                 *next_parent += 1;
                 if on_stack.contains(parent) {
-                    return Err(ClusterError::Cycle { tx: parent });
+                    return Err(parent);
                 }
                 if !done.contains(parent) {
                     stack.push((parent, 0));
