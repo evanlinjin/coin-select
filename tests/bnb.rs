@@ -32,8 +32,8 @@ struct MinExcessThenWeight;
 const EXCESS_RATIO: f32 = 1_000_000_f32;
 
 impl BnbMetric for MinExcessThenWeight {
-    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
-        let excess = cs.excess(target, Drain::NONE);
+    fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
+        let excess = cs.excess(Drain::NONE);
         if excess < 0 {
             None
         } else {
@@ -43,13 +43,13 @@ impl BnbMetric for MinExcessThenWeight {
         }
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn bound(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
         let mut cs = cs.clone();
-        cs.select_until_target_met(target).ok()?;
+        cs.select_until_target_met().ok()?;
         Some(Ordf32(cs.input_weight() as f32))
     }
 
-    fn drain(&mut self, _cs: &CoinSelector<'_>, _target: Target) -> Drain {
+    fn drain(&mut self, _cs: &CoinSelector<'_>) -> Drain {
         Drain::NONE
     }
 }
@@ -68,19 +68,11 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
     });
 
     let solution: Vec<Candidate> = (0..solution_len).map(|_| wv.next().unwrap()).collect();
-    let solution_weight = {
-        let mut cs = CoinSelector::new(&solution);
-        cs.select_all();
-        cs.input_weight()
-    };
-
     let target_value = solution.iter().map(|c| c.value).sum();
 
-    let mut candidates = solution;
+    let mut candidates = solution.clone();
     candidates.extend(wv.take(num_additional_canidates));
     candidates.sort_unstable_by_key(|wv| core::cmp::Reverse(wv.value));
-
-    let cs = CoinSelector::new(&candidates);
 
     let target = Target {
         outputs: TargetOutputs {
@@ -93,7 +85,14 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
         max_weight: None,
     };
 
-    let solutions = cs.bnb_solutions(target, MinExcessThenWeight);
+    let solution_weight = {
+        let mut cs = CoinSelector::new(&solution, target);
+        cs.select_all();
+        cs.input_weight()
+    };
+
+    let cs = CoinSelector::new(&candidates, target);
+    let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
     let mut rounds = 0;
     let (best, score) = solutions
@@ -116,8 +115,6 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
     let wv = test_wv(&mut rng);
     let candidates = wv.take(num_inputs).collect::<Vec<_>>();
 
-    let cs = CoinSelector::new(&candidates);
-
     let target = Target {
         outputs: TargetOutputs {
             value_sum: target_value,
@@ -128,7 +125,8 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
         max_weight: None,
     };
 
-    let solutions = cs.bnb_solutions(target, MinExcessThenWeight);
+    let cs = CoinSelector::new(&candidates, target);
+    let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
     let mut rounds = 0;
     let (sol, _score) = solutions
@@ -139,7 +137,7 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
         .expect("found a solution");
 
     assert_eq!(rounds, 164);
-    let excess = sol.excess(target, Drain::NONE);
+    let excess = sol.excess(Drain::NONE);
     assert_eq!(excess, 0);
 }
 
@@ -150,19 +148,18 @@ proptest! {
         let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
         let wv = test_wv(&mut rng);
         let candidates = wv.take(num_inputs).collect::<Vec<_>>();
-        let cs = CoinSelector::new(&candidates);
 
         let target = Target {
             outputs: TargetOutputs { value_sum: target_value, weight_sum: 0, n_outputs: 1 },
             fee: TargetFee::ZERO,
             max_weight: None,
         };
-
-        let solutions = cs.bnb_solutions(target, MinExcessThenWeight);
+        let cs = CoinSelector::new(&candidates, target);
+        let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
         match solutions.enumerate().filter_map(|(i, sol)| Some((i, sol?))).last() {
             Some((_i, (sol, _score))) => assert!(sol.selected_value() >= target_value),
-            _ => prop_assert!(!cs.is_fundable(target)),
+            _ => prop_assert!(!cs.is_fundable()),
         }
     }
 
@@ -177,26 +174,10 @@ proptest! {
         let mut wv = test_wv(&mut rng);
 
         let solution: Vec<Candidate> = (0..solution_len).map(|_| wv.next().unwrap()).collect();
-        let solution_weight = {
-            let mut cs = CoinSelector::new(&solution);
-            cs.select_all();
-            cs.input_weight()
-        };
-
         let target_value = solution.iter().map(|c| c.value).sum();
 
-        let mut candidates = solution;
+        let mut candidates = solution.clone();
         candidates.extend(wv.take(num_additional_canidates));
-
-        let mut cs = CoinSelector::new(&candidates);
-
-
-        for i in 0..num_preselected.min(solution_len) {
-            cs.select(i);
-        }
-
-        // sort in descending value
-        cs.sort_candidates_by_key(|(_, wv)| core::cmp::Reverse(wv.value));
 
         let target = Target {
             outputs: TargetOutputs { value_sum: target_value, weight_sum: 0, n_outputs: 1 },
@@ -205,7 +186,21 @@ proptest! {
             max_weight: None,
         };
 
-        let solutions = cs.bnb_solutions(target, MinExcessThenWeight);
+        let solution_weight = {
+            let mut cs = CoinSelector::new(&solution, target);
+            cs.select_all();
+            cs.input_weight()
+        };
+
+        let mut cs = CoinSelector::new(&candidates, target);
+        for i in 0..num_preselected.min(solution_len) {
+            cs.select(i);
+        }
+
+        // sort in descending value
+        cs.sort_candidates_by_key(|(_, wv)| core::cmp::Reverse(wv.value));
+
+        let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
         let (_i, (best, _score)) = solutions
             .enumerate()
