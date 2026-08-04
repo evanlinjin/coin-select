@@ -51,7 +51,7 @@ where
 
     let target = params.target();
 
-    let mut selection = CoinSelector::new(&candidates);
+    let mut selection = CoinSelector::new(&candidates, target);
     let mut exp_selection = selection.clone();
 
     if metric.requires_ordering_by_descending_value_pwu() {
@@ -61,8 +61,8 @@ where
 
     println!("\texhaustive search:");
     let now = std::time::Instant::now();
-    let exp_result = exhaustive_search(&mut exp_selection, target, &mut metric);
-    let exp_change = metric.drain(&exp_selection, target);
+    let exp_result = exhaustive_search(&mut exp_selection, &mut metric);
+    let exp_change = metric.drain(&exp_selection);
     let exp_result_str = result_string(&exp_result.ok_or("no possible solution"), exp_change);
     println!(
         "\t\telapsed={:8}s result={}",
@@ -72,7 +72,7 @@ where
     // bonus check: ensure replacement fee is respected
     if exp_result.is_some() {
         let selected_value = exp_selection.selected_value();
-        let drain = metric.drain(&exp_selection, target);
+        let drain = metric.drain(&exp_selection);
         let target_value = target.value();
         let replace_fee = params
             .replace
@@ -87,8 +87,8 @@ where
     println!("\tbranch and bound:");
     let now = std::time::Instant::now();
     let mut bnb_metric = metric.clone();
-    let result = bnb_search(&mut selection, target, metric, usize::MAX);
-    let change = bnb_metric.drain(&selection, target);
+    let result = bnb_search(&mut selection, metric, usize::MAX);
+    let change = bnb_metric.drain(&selection);
     let result_str = result_string(&result, change);
     println!(
         "\t\telapsed={:8}s result={}",
@@ -112,7 +112,7 @@ where
 
             // bonus check: ensure replacement fee is respected
             let selected_value = selection.selected_value();
-            let drain = bnb_metric.drain(&selection, target);
+            let drain = bnb_metric.drain(&selection);
             let target_value = target.value();
             let replace_fee = params
                 .replace
@@ -148,7 +148,7 @@ where
     let target = params.target();
 
     let init_cs = {
-        let mut cs = CoinSelector::new(&candidates);
+        let mut cs = CoinSelector::new(&candidates, target);
         if metric.requires_ordering_by_descending_value_pwu() {
             cs.sort_candidates_by_descending_value_pwu();
         }
@@ -157,12 +157,12 @@ where
     print_candidates(&params, &init_cs);
 
     for (cs, _) in ExhaustiveIter::new(&init_cs).into_iter().flatten() {
-        if let Some(lb_score) = metric.bound(&cs, target) {
+        if let Some(lb_score) = metric.bound(&cs) {
             // This is the branch's lower bound. In other words, this is the BEST selection
             // possible (can overshoot) traversing down this branch. Let's check that!
 
-            if let Some(score) = metric.score(&cs, target) {
-                let has_change = metric.drain(&cs, target).is_some();
+            if let Some(score) = metric.score(&cs) {
+                let has_change = metric.drain(&cs).is_some();
                 prop_assert!(
                     score >= lb_score,
                     "checking branch: selection={} score={} change={} lb={}",
@@ -178,9 +178,9 @@ where
                 .flatten()
                 .filter(|(_, inc)| *inc)
             {
-                if let Some(descendant_score) = metric.score(&descendant_cs, target) {
-                    let parent_has_change = metric.drain(&cs, target).is_some();
-                    let descendant_has_change = metric.drain(&descendant_cs, target).is_some();
+                if let Some(descendant_score) = metric.score(&descendant_cs) {
+                    let parent_has_change = metric.drain(&cs).is_some();
+                    let descendant_has_change = metric.drain(&descendant_cs).is_some();
                     prop_assert!(
                         descendant_score >= lb_score,
                         "
@@ -190,7 +190,7 @@ where
                         cs,
                         parent_has_change,
                         lb_score,
-                        cs.is_funded(target),
+                        cs.is_funded(),
                         descendant_cs,
                         descendant_has_change,
                         descendant_score,
@@ -340,11 +340,7 @@ impl<'a> Iterator for ExhaustiveIter<'a> {
     }
 }
 
-pub fn exhaustive_search<M>(
-    cs: &mut CoinSelector,
-    target: Target,
-    metric: &mut M,
-) -> Option<(Ordf32, usize)>
+pub fn exhaustive_search<M>(cs: &mut CoinSelector, metric: &mut M) -> Option<(Ordf32, usize)>
 where
     M: BnbMetric,
 {
@@ -359,7 +355,7 @@ where
         .enumerate()
         .inspect(|(i, _)| rounds = *i)
         .filter(|(_, (_, inclusion))| *inclusion)
-        .filter_map(|(_, (cs, _))| metric.score(&cs, target).map(|score| (cs, score)));
+        .filter_map(|(_, (cs, _))| metric.score(&cs).map(|score| (cs, score)));
 
     for (child_cs, score) in iter {
         match &mut best {
@@ -388,10 +384,8 @@ where
 /// [`CoinSelector::is_funded`] + [`CoinSelector::is_within_max_weight`], so it inherits the
 /// exact weight model and is independent of the BnB weight prune it audits. Exponential — small `n`
 /// only.
-pub fn exact_selection_possible(cs: &CoinSelector, target: Target) -> bool {
-    let feasible = |s: &CoinSelector| {
-        s.is_funded(target) && s.is_within_max_weight(target, DrainWeights::NONE)
-    };
+pub fn exact_selection_possible(cs: &CoinSelector) -> bool {
+    let feasible = |s: &CoinSelector| s.is_funded() && s.is_within_max_weight(DrainWeights::NONE);
     // the current selection itself (no additions) is a valid subset and isn't yielded by the iter
     feasible(cs)
         || ExhaustiveIter::new(cs)
@@ -401,7 +395,6 @@ pub fn exact_selection_possible(cs: &CoinSelector, target: Target) -> bool {
 
 pub fn bnb_search<M>(
     cs: &mut CoinSelector,
-    target: Target,
     metric: M,
     max_rounds: usize,
 ) -> Result<(Ordf32, usize), NoBnbSolution>
@@ -410,7 +403,7 @@ where
 {
     let mut rounds = 0_usize;
     let (selection, score) = cs
-        .bnb_solutions(target, metric)
+        .bnb_solutions(metric)
         .inspect(|_| rounds += 1)
         .take(max_rounds)
         .flatten()
@@ -448,8 +441,8 @@ pub fn compare_against_benchmarks<M: BnbMetric + Clone>(
     let start = std::time::Instant::now();
     let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
     let target = params.target();
-    let cs = CoinSelector::new(&candidates);
-    let solutions = cs.bnb_solutions(target, metric.clone());
+    let cs = CoinSelector::new(&candidates, target);
+    let solutions = cs.bnb_solutions(metric.clone());
 
     let best = solutions
         .enumerate()
@@ -465,7 +458,7 @@ pub fn compare_against_benchmarks<M: BnbMetric + Clone>(
                         core::cmp::Reverse(Ordf32(wv.effective_value(target.fee.rate)))
                     });
                     // we filter out failing onces below
-                    let _ = naive_select.select_until_target_met(target);
+                    let _ = naive_select.select_until_target_met();
                     naive_select
                 },
                 {
@@ -485,7 +478,7 @@ pub fn compare_against_benchmarks<M: BnbMetric + Clone>(
                     // exists, so the comparison below isn't vacuous.
                     let mut greedy = cs.clone();
                     greedy.sort_candidates_by_descending_value_pwu();
-                    let _ = greedy.select_until_target_met(target);
+                    let _ = greedy.select_until_target_met();
                     greedy
                 },
             ];
@@ -501,11 +494,11 @@ pub fn compare_against_benchmarks<M: BnbMetric + Clone>(
             let cmp_benchmarks = cmp_benchmarks
                 .into_iter()
                 .filter_map(|cs| {
-                    let score = metric.clone().score(&cs, target)?;
+                    let score = metric.clone().score(&cs)?;
                     Some((cs, score))
                 })
                 .collect::<Vec<_>>();
-            let sol_score = metric.score(&sol, target);
+            let sol_score = metric.score(&sol);
 
             for (_bench_id, (mut bench, bench_score)) in cmp_benchmarks.into_iter().enumerate() {
                 prop_assert!(
@@ -526,7 +519,7 @@ pub fn compare_against_benchmarks<M: BnbMetric + Clone>(
         None => {
             // Full feasibility (value *and* max_weight) is needed here; `is_fundable`
             // only covers value, so use the exact exhaustive oracle to assert impossibility.
-            prop_assert!(!exact_selection_possible(&cs, target));
+            prop_assert!(!exact_selection_possible(&cs));
         }
     }
 
@@ -546,8 +539,8 @@ fn randomly_satisfy_target<'a, R: rand::Rng>(
     let mut last_score: Option<Ordf32> = None;
     while let Some(next) = cs.unselected_indices().choose(rng) {
         cs.select(next);
-        if cs.is_funded(target) {
-            let curr_score = metric.score(&cs, target);
+        if cs.is_funded() {
+            let curr_score = metric.score(&cs);
             if let Some(last_score) = last_score {
                 if curr_score.is_none() || curr_score.unwrap() > last_score {
                     break;

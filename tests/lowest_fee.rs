@@ -91,11 +91,11 @@ proptest! {
             params.n_candidates
         ];
 
-        let mut cs = CoinSelector::new(&candidates);
+        let mut cs = CoinSelector::new(&candidates, params.target());
 
         let metric = params.lowest_fee_metric();
-        let is_impossible = !cs.is_fundable(params.target());
-        match common::bnb_search(&mut cs, params.target(), metric, params.n_candidates * 10) {
+        let is_impossible = !cs.is_fundable();
+        match common::bnb_search(&mut cs, metric, params.n_candidates * 10) {
             Ok((score, rounds)) => {
                 // the +1 is because the iterator will always try selecting nothing as a solution so we have
                 // to do one extra iteration to try that
@@ -162,10 +162,10 @@ proptest! {
         let target = params.target();
         let metric = params.lowest_fee_metric();
 
-        let exact_possible = common::exact_selection_possible(&CoinSelector::new(&candidates), target);
+        let exact_possible = common::exact_selection_possible(&CoinSelector::new(&candidates, target));
 
-        let mut cs = CoinSelector::new(&candidates);
-        let bnb_found = common::bnb_search(&mut cs, target, metric, usize::MAX).is_ok();
+        let mut cs = CoinSelector::new(&candidates, target);
+        let bnb_found = common::bnb_search(&mut cs, metric, usize::MAX).is_ok();
         prop_assert_eq!(
             bnb_found, exact_possible,
             "bnb_found={} but exact_possible={} (weight prune may have dropped a feasible subtree)",
@@ -195,23 +195,21 @@ fn combined_changeless_metric() {
     };
 
     let candidates = common::gen_candidates(params.n_candidates);
-    let mut cs_a = CoinSelector::new(&candidates);
-    let mut cs_b = CoinSelector::new(&candidates);
-
     let target = params.target();
+    let mut cs_a = CoinSelector::new(&candidates, target);
+    let mut cs_b = CoinSelector::new(&candidates, target);
     let metric_lowest_fee = params.lowest_fee_metric();
 
     let metric_changeless = Changeless(params.lowest_fee_metric());
 
     // cs_a uses the unconstrained metric
-    let (score, rounds) = common::bnb_search(&mut cs_a, target, metric_lowest_fee, usize::MAX)
-        .expect("must find solution");
+    let (score, rounds) =
+        common::bnb_search(&mut cs_a, metric_lowest_fee, usize::MAX).expect("must find solution");
     println!("score={:?} rounds={}", score, rounds);
 
     // cs_b uses the changeless-constrained metric
     let (combined_score, combined_rounds) =
-        common::bnb_search(&mut cs_b, target, metric_changeless, usize::MAX)
-            .expect("must find solution");
+        common::bnb_search(&mut cs_b, metric_changeless, usize::MAX).expect("must find solution");
     println!("score={:?} rounds={}", combined_score, combined_rounds);
 
     assert!(combined_rounds >= rounds);
@@ -256,7 +254,7 @@ fn does_not_create_change_below_spend_cost() {
         },
     ];
 
-    let mut cs = CoinSelector::new(&candidates);
+    let mut cs = CoinSelector::new(&candidates, target);
 
     let drain_weights = DrainWeights {
         output_weight: 100,
@@ -270,17 +268,17 @@ fn does_not_create_change_below_spend_cost() {
         drain_weights,
     };
 
-    let (score, _) = common::bnb_search(&mut cs, target, metric, 10).expect("finds solution");
+    let (score, _) = common::bnb_search(&mut cs, metric, 10).expect("finds solution");
 
     // The optimal selection is candidate 0 alone, and it must be changeless.
     let expected = {
-        let mut expected = CoinSelector::new(&candidates);
+        let mut expected = CoinSelector::new(&candidates, target);
         expected.select(0);
         expected
     };
     assert_eq!(cs.selected_indices(), expected.selected_indices());
     assert!(
-        metric.drain(&cs, target).is_none(),
+        metric.drain(&cs).is_none(),
         "optimal selection must be changeless"
     );
 
@@ -290,12 +288,7 @@ fn does_not_create_change_below_spend_cost() {
         with_extra_input.select(2);
         with_extra_input
     };
-    assert!(
-        score
-            <= metric
-                .score(&with_extra_input, target)
-                .expect("target is met")
-    );
+    assert!(score <= metric.score(&with_extra_input).expect("target is met"));
 }
 
 #[test]
@@ -338,14 +331,13 @@ fn zero_fee_tx() {
         n_outputs: 1,
     };
 
-    let mut cs = CoinSelector::new(&candidates);
+    let mut cs = CoinSelector::new(&candidates, target);
     let metric = LowestFee {
         long_term_feerate,
         dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
         drain_weights,
     };
-    let (_score, _rounds) =
-        common::bnb_search(&mut cs, target, metric, 1000).expect("must find solution");
+    let (_score, _rounds) = common::bnb_search(&mut cs, metric, 1000).expect("must find solution");
 }
 
 // --- `run_bnb` failure classification (`NoBnbSolution` variants) ---
@@ -379,14 +371,14 @@ fn err_outputs(value_sum: u64) -> TargetOutputs {
 fn run_bnb_reports_insufficient_funds() {
     // Two 100k inputs can't cover a 10M target: the value is simply unreachable.
     let candidates = [err_candidate(100_000), err_candidate(100_000)];
-    let mut cs = CoinSelector::new(&candidates);
     let target = Target {
         outputs: err_outputs(10_000_000),
         fee: TargetFee::ZERO,
         max_weight: None,
     };
+    let mut cs = CoinSelector::new(&candidates, target);
     assert_eq!(
-        cs.run_bnb(target, err_metric(), 100_000).unwrap_err(),
+        cs.run_bnb(err_metric(), 100_000).unwrap_err(),
         NoBnbSolution::InsufficientFunds,
     );
 }
@@ -400,14 +392,14 @@ fn run_bnb_reports_max_weight_exceeded() {
         err_candidate(100_000),
         err_candidate(100_000),
     ];
-    let mut cs = CoinSelector::new(&candidates);
     let target = Target {
         outputs: err_outputs(250_000),
         fee: TargetFee::ZERO,
         max_weight: Some(1),
     };
+    let mut cs = CoinSelector::new(&candidates, target);
     assert_eq!(
-        cs.run_bnb(target, err_metric(), 100_000).unwrap_err(),
+        cs.run_bnb(err_metric(), 100_000).unwrap_err(),
         NoBnbSolution::MaxWeightExceeded,
     );
 }
@@ -420,14 +412,14 @@ fn run_bnb_reports_round_limit() {
         err_candidate(100_000),
         err_candidate(100_000),
     ];
-    let mut cs = CoinSelector::new(&candidates);
     let target = Target {
         outputs: err_outputs(250_000),
         fee: TargetFee::ZERO,
         max_weight: None,
     };
+    let mut cs = CoinSelector::new(&candidates, target);
     assert_eq!(
-        cs.run_bnb(target, err_metric(), 0).unwrap_err(),
+        cs.run_bnb(err_metric(), 0).unwrap_err(),
         NoBnbSolution::RoundLimit {
             max_rounds: 0,
             rounds: 0,
