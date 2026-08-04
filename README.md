@@ -53,13 +53,13 @@ let candidates = vec![
 ];
 
 // You can now select coins!
-let mut coin_selector = CoinSelector::new(&candidates);
+let mut coin_selector = CoinSelector::new(&candidates, target);
 coin_selector.select(0);
 
-assert!(!coin_selector.is_funded(target), "we didn't select enough");
-println!("we didn't select enough yet we're missing: {}", coin_selector.missing(target));
+assert!(!coin_selector.is_funded(), "we didn't select enough");
+println!("we didn't select enough yet we're missing: {}", coin_selector.missing());
 coin_selector.select(1);
-assert!(coin_selector.is_funded(target), "we should have enough now");
+assert!(coin_selector.is_funded(), "we should have enough now");
 
 // Now we need to know if we need a change output to drain the excess if we overshot too much
 //
@@ -68,7 +68,7 @@ assert!(coin_selector.is_funded(target), "we should have enough now");
 let drain_weights = DrainWeights::TR_KEYSPEND; 
 // Our policy is to only add a change output if the value is over 1_000 sats
 let change_policy = ChangePolicy::min_value(drain_weights, 1_000);
-let change = coin_selector.drain(target, change_policy);
+let change = coin_selector.drain(change_policy);
 if change.is_some() {
     println!("We need to add our change output to the transaction with {} value", change.value);
 } else {
@@ -126,13 +126,13 @@ let drain_weights = bdk_coin_select::DrainWeights::default();
 // You could determine this by looking at the user's transaction history and taking an average of the feerate.
 let long_term_feerate = FeeRate::from_sat_per_vb(10.0);
 
-let mut coin_selector = CoinSelector::new(&candidates);
-
 let target = Target {
     fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(15.0)),
     outputs: TargetOutputs::fund_outputs(outputs.iter().map(|output| (output.weight().to_wu(), output.value.to_sat()))),
     max_weight: None,
 };
+
+let mut coin_selector = CoinSelector::new(&candidates, target);
 
 // The feerate used to work out whether a change output would be dust (and so shouldn't be added).
 // The standard dust relay feerate is 3 sat/vb.
@@ -149,13 +149,13 @@ let mut metric = LowestFee {
 
 // We run the branch and bound algorithm with a max round limit of 100,000.
 // On success it returns the score along with the change output the metric decided on.
-let change = match coin_selector.run_bnb(target, metric, 100_000) {
+let change = match coin_selector.run_bnb(metric, 100_000) {
     Err(err) => {
         println!("failed to find a solution: {}", err);
         // fall back to naive selection
-        coin_selector.select_until_target_met(target).expect("a selection was impossible!");
+        coin_selector.select_until_target_met().expect("a selection was impossible!");
         // the metric still decides the change output for whatever we end up selecting
-        metric.drain(&coin_selector, target)
+        metric.drain(&coin_selector)
     }
     Ok((score, change)) => {
         println!("we found a solution with score {}", score);
