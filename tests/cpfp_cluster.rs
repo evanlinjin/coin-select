@@ -165,33 +165,59 @@ fn an_overpaying_descendant_carries_its_deficient_parent() {
 }
 
 #[test]
-fn cluster_rejects_malformed_input() {
-    assert_eq!(
-        try_cluster(vec![tx(400, 0, vec![7])], vec![]).unwrap_err(),
-        ClusterError::UnknownParent {
-            child: 0,
-            parent: 7
-        }
-    );
-    assert_eq!(
-        try_cluster(vec![tx(400, 0, vec![])], vec![(0, 3)]).unwrap_err(),
-        ClusterError::UnknownSpend {
-            candidate: 0,
-            tx: 3
-        }
-    );
+fn cluster_rejects_a_cycle() {
     assert!(matches!(
         try_cluster(vec![tx(400, 0, vec![1]), tx(400, 0, vec![0])], vec![(0, 0)]),
         Err(ClusterError::Cycle { .. })
     ));
+}
 
-    let mut duplicated = ClusterBuilder::new();
-    duplicated.tx("a", 400, 0, []);
-    duplicated.tx("a", 500, 0, []);
-    assert_eq!(
-        duplicated.build().unwrap_err(),
-        ClusterError::DuplicateTx { tx: "a" }
-    );
+/// Bump owed by candidate 0 under a cluster assembled by `f`, at the fixture target's feerate.
+fn cluster_bump(f: impl FnOnce(&mut ClusterBuilder<&'static str>)) -> u64 {
+    let mut builder = ClusterBuilder::new();
+    f(&mut builder);
+    let cluster = builder.build().expect("acyclic");
+    let candidates = candidates(1);
+    let mut cs = CoinSelector::new(&candidates, target()).with_cluster(&cluster);
+    cs.select(0);
+    cs.selected_ancestor_bump_fee()
+}
+
+/// Cluster membership *is* the definition of unconfirmed. A parent edge or a spend pointing at a
+/// transaction that was never added means a confirmed output — dropped, not an error — so the
+/// caller can dump every prevout, unfiltered.
+#[test]
+fn ids_outside_the_cluster_are_confirmed() {
+    // Candidate 0's tx names a parent that is not in the cluster: priced as if parentless.
+    let with_unknown_parent = cluster_bump(|b| {
+        b.tx("stuck", 400, 10, ["confirmed-somewhere"]);
+        b.spent_by("stuck", 0);
+    });
+    let without = cluster_bump(|b| {
+        b.tx("stuck", 400, 10, []);
+        b.spent_by("stuck", 0);
+    });
+    assert_eq!(with_unknown_parent, without);
+    assert_eq!(with_unknown_parent, 990, "100 vB owing 1000, paid 10");
+
+    // A spend of a transaction not in the cluster drags in nothing at all.
+    let confirmed_spend = cluster_bump(|b| {
+        b.tx("unrelated", 400, 10, []);
+        b.spent_by("not-here", 0);
+    });
+    assert_eq!(confirmed_spend, 0);
+}
+
+/// Adding the same id twice is a no-op — the first record wins — so overlapping ancestry walks
+/// need not coordinate.
+#[test]
+fn adding_a_tx_twice_is_a_no_op() {
+    let bump = cluster_bump(|b| {
+        b.tx("stuck", 400, 10, []);
+        b.tx("stuck", 40_000, 0, []); // ignored
+        b.spent_by("stuck", 0);
+    });
+    assert_eq!(bump, 990, "the first record won");
 }
 
 /// The builder is keyed by the caller's own ids — insertion order does not matter, a child may

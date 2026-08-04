@@ -29,16 +29,21 @@ pub(crate) struct MempoolTx {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ClusterBuilder<Id> {
-    /// (id, weight, fee, parent ids), in insertion order.
+    /// (id, weight, fee, parent ids), in first-insertion order.
     txs: Vec<(Id, u64, u64, Vec<Id>)>,
+    /// Id -> tx position in `txs`, maintained as transactions are added so a duplicate add can be
+    /// ignored on the spot.
+    index_of: BTreeMap<Id, usize>,
     /// (candidate index, tx id).
     spends: Vec<(usize, Id)>,
 }
 
-impl<Id> Default for ClusterBuilder<Id> {
+// `Id: Ord` because `BTreeMap::new` demanded it before Rust 1.66, and our MSRV is 1.54.
+impl<Id: Ord> Default for ClusterBuilder<Id> {
     fn default() -> Self {
         Self {
             txs: Vec::new(),
+            index_of: BTreeMap::new(),
             spends: Vec::new(),
         }
     }
@@ -52,16 +57,31 @@ impl<Id: Ord + Clone> ClusterBuilder<Id> {
     }
 
     /// Record an unconfirmed transaction: its `weight` in weight units, the `fee` it already pays
-    /// in satoshis, and the ids of its *direct* in-cluster parents — transitive ancestors are
-    /// derived, which is much of the point of supplying a graph rather than a list. Parents
-    /// need not have been added yet.
+    /// in satoshis, and the ids of its *direct* parents — transitive ancestors are derived, which
+    /// is much of the point of supplying a graph rather than a list.
+    ///
+    /// List every input's prevout id, unfiltered: a parent never added to the builder is treated
+    /// as a confirmed output and dropped, so cluster membership alone decides what is unconfirmed
+    /// — the same way mempool membership does for a node. Insertion order is irrelevant.
+    ///
+    /// Adding the same id again is a no-op (the first record wins), so overlapping ancestry walks
+    /// — two candidates sharing a parent — can each add it without coordinating.
     pub fn tx(&mut self, id: Id, weight: u64, fee: u64, parents: impl IntoIterator<Item = Id>) {
+        use alloc::collections::btree_map;
+        match self.index_of.entry(id.clone()) {
+            btree_map::Entry::Vacant(entry) => entry.insert(self.txs.len()),
+            btree_map::Entry::Occupied(_) => return,
+        };
         self.txs
             .push((id, weight, fee, parents.into_iter().collect()));
     }
 
     /// Record that the candidate at `candidate_index` (into the slice given to
     /// [`CoinSelector::new`]) spends an output of the transaction `id`.
+    ///
+    /// As with parent edges, an `id` never added to the builder means a confirmed output is being
+    /// spent, and the call is a no-op — so this too can be called for every candidate's prevout,
+    /// unfiltered.
     ///
     /// Both directions are many: a transaction may be spent by several candidates, and a candidate
     /// may appear more than once when it spends outputs of several transactions — its package is
@@ -76,54 +96,31 @@ impl<Id: Ord + Clone> ClusterBuilder<Id> {
     ///
     /// # Errors
     ///
-    /// [`ClusterError`], naming the offending ids: a duplicated transaction, a parent or spent
-    /// transaction that was never added, or a cycle in the parent relation (real mempool graphs
-    /// are acyclic; an id scheme that cycles is a caller bug).
+    /// [`ClusterError::Cycle`] if the parent relation cycles. Real mempool graphs are acyclic, so
+    /// an id scheme that cycles is a caller bug.
     pub fn build(self) -> Result<Cluster, ClusterError<Id>> {
-        let mut index_of = BTreeMap::new();
-        for (index, (id, _, _, _)) in self.txs.iter().enumerate() {
-            if index_of.insert(id.clone(), index).is_some() {
-                return Err(ClusterError::DuplicateTx { tx: id.clone() });
-            }
-        }
+        // A parent never added to the builder is a confirmed output: cluster membership *is* the
+        // definition of unconfirmed, exactly as mempool membership is for a node.
+        let txs = self
+            .txs
+            .iter()
+            .map(|(_, weight, fee, parents)| MempoolTx {
+                weight: *weight,
+                fee: *fee,
+                parents: parents
+                    .iter()
+                    .filter_map(|parent| self.index_of.get(parent).copied())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
 
-        let txs =
-            self.txs
-                .iter()
-                .map(|(id, weight, fee, parents)| {
-                    let parents = parents
-                        .iter()
-                        .map(|parent| {
-                            index_of.get(parent).copied().ok_or_else(|| {
-                                ClusterError::UnknownParent {
-                                    child: id.clone(),
-                                    parent: parent.clone(),
-                                }
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(MempoolTx {
-                        weight: *weight,
-                        fee: *fee,
-                        parents,
-                    })
-                })
-                .collect::<Result<Vec<_>, ClusterError<Id>>>()?;
-
+        // Same rule: spending a transaction that is not in the cluster is spending a confirmed
+        // output, which drags in nothing.
         let candidate_spends = self
             .spends
             .iter()
-            .map(|(candidate, id)| {
-                let tx = index_of
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| ClusterError::UnknownSpend {
-                        candidate: *candidate,
-                        tx: id.clone(),
-                    })?;
-                Ok((*candidate, tx))
-            })
-            .collect::<Result<Vec<_>, ClusterError<Id>>>()?;
+            .filter_map(|(candidate, id)| Some((*candidate, self.index_of.get(id).copied()?)))
+            .collect();
 
         let closures = ancestor_closures(&txs).map_err(|index| ClusterError::Cycle {
             tx: self.txs[index].0.clone(),
@@ -155,12 +152,18 @@ impl<Id: Ord + Clone> ClusterBuilder<Id> {
 ///
 /// # Completeness
 ///
-/// Include the descendants and siblings of your ancestors where you know them — a parent already
-/// being paid for by *another* child needs no bump, and only a transaction present in the cluster
-/// can demonstrate that. Where you don't know them (a child belonging to someone else), the
-/// package is priced as if it needs the bump: you overpay, the transaction still confirms. That is
-/// the safe direction, and it is the reason this is an optimality limit rather than a correctness
-/// one.
+/// Membership in the cluster *is* the definition of unconfirmed: a transaction that was never
+/// added is treated as confirmed wherever it is referenced, the same way a node treats anything
+/// outside its mempool. That makes construction easy — list every prevout, unfiltered — but it
+/// puts completeness on the caller, and the two directions are not symmetric:
+///
+/// - **Unconfirmed ancestors must all be present.** An underpaying parent omitted from the
+///   cluster is priced as confirmed, so the package is silently *under*-priced and the
+///   transaction can fall short of the target feerate. This is the unsafe direction.
+/// - **Descendants and siblings are best-effort.** A parent already being paid for by *another*
+///   child needs no bump, and only a transaction present in the cluster can demonstrate that.
+///   Where you don't know them (a child belonging to someone else), the package is priced as if
+///   it needs the bump: you overpay, the transaction still confirms. Safe, merely suboptimal.
 ///
 /// [`CoinSelector::with_cluster`]: crate::CoinSelector::with_cluster
 /// [`CoinSelector::ancestor_bump_fee_of`]: crate::CoinSelector::ancestor_bump_fee_of
@@ -173,29 +176,10 @@ pub struct Cluster {
     closures: Vec<Bitset>,
 }
 
-/// Error returned by [`ClusterBuilder::build`], naming the offending transactions by the caller's
-/// own ids.
+/// Error returned by [`ClusterBuilder::build`], naming the offending transaction by the caller's
+/// own id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterError<Id> {
-    /// The same transaction id was added twice.
-    DuplicateTx {
-        /// The duplicated id.
-        tx: Id,
-    },
-    /// A transaction names a parent that was never added.
-    UnknownParent {
-        /// The transaction naming the missing parent.
-        child: Id,
-        /// The missing parent.
-        parent: Id,
-    },
-    /// A candidate spends a transaction that was never added.
-    UnknownSpend {
-        /// The candidate index.
-        candidate: usize,
-        /// The missing transaction.
-        tx: Id,
-    },
     /// The parent relation contains a cycle, so the transactions cannot all be ancestors of each
     /// other. Real mempool clusters are acyclic.
     Cycle {
@@ -207,19 +191,6 @@ pub enum ClusterError<Id> {
 impl<Id: core::fmt::Debug> core::fmt::Display for ClusterError<Id> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            ClusterError::DuplicateTx { tx } => {
-                write!(f, "transaction {:?} was added more than once", tx)
-            }
-            ClusterError::UnknownParent { child, parent } => write!(
-                f,
-                "transaction {:?} names parent {:?}, which is not in the cluster",
-                child, parent
-            ),
-            ClusterError::UnknownSpend { candidate, tx } => write!(
-                f,
-                "candidate {} spends transaction {:?}, which is not in the cluster",
-                candidate, tx
-            ),
             ClusterError::Cycle { tx } => {
                 write!(f, "the parent relation cycles through transaction {:?}", tx)
             }
