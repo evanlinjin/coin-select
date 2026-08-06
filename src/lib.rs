@@ -16,13 +16,10 @@ pub use bitset::*;
 mod coin_selector;
 pub mod float;
 pub use coin_selector::*;
-
 mod bnb;
 pub use bnb::*;
-
-pub mod metrics;
-
 mod feerate;
+pub mod metrics;
 pub use feerate::*;
 mod target;
 pub use target::*;
