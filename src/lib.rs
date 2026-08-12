@@ -16,15 +16,20 @@ pub use bitset::*;
 mod coin_selector;
 pub mod float;
 pub use coin_selector::*;
+
 mod bnb;
 pub use bnb::*;
-mod feerate;
+
 pub mod metrics;
+
+mod feerate;
 pub use feerate::*;
 mod target;
 pub use target::*;
 mod drain;
 pub use drain::*;
+mod selection_problem;
+pub use selection_problem::*;
 
 /// Txin "base" fields include `outpoint` (32+4) and `nSequence` (4) and 1 byte for the scriptSig
 /// length.

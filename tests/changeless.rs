@@ -3,7 +3,8 @@ mod common;
 use bdk_coin_select::{
     float::Ordf32,
     metrics::{Changeless, LowestFee},
-    Candidate, CoinSelector, DrainWeights, FeeRate, Target, TargetFee, TargetOutputs,
+    Candidate, CoinSelector, DrainWeights, FeeRate, SelectionProblem, Target, TargetFee,
+    TargetOutputs,
 };
 use proptest::{prelude::*, proptest, test_runner::*};
 use rand::{prelude::IteratorRandom, Rng, RngCore};
@@ -22,7 +23,6 @@ fn test_wv(mut rng: impl RngCore) -> impl Iterator<Item = Candidate> {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        ..Default::default()
     })]
 
     #[test]
@@ -67,7 +67,8 @@ proptest! {
             },
             max_weight: None,
         };
-        let cs = CoinSelector::new(&candidates, target);
+        let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let cs = CoinSelector::new(&problem);
 
         let make_metric = || {
             Changeless(LowestFee {

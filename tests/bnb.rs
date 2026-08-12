@@ -1,6 +1,7 @@
 mod common;
 use bdk_coin_select::{
-    float::Ordf32, BnbMetric, Candidate, CoinSelector, Drain, Target, TargetFee, TargetOutputs,
+    float::Ordf32, BnbMetric, Candidate, CoinSelector, Drain, SelectionProblem, Target, TargetFee,
+    TargetOutputs,
 };
 #[macro_use]
 extern crate alloc;
@@ -83,12 +84,14 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
     };
 
     let solution_weight = {
-        let mut cs = CoinSelector::new(&solution, target);
+        let problem = SelectionProblem::new_no_ancestors(target, solution.iter().copied());
+        let mut cs = CoinSelector::new(&problem);
         cs.select_all();
         cs.input_weight()
     };
 
-    let cs = CoinSelector::new(&candidates, target);
+    let problem_2 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let cs = CoinSelector::new(&problem_2);
     let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
     let mut rounds = 0;
@@ -122,7 +125,8 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
         max_weight: None,
     };
 
-    let cs = CoinSelector::new(&candidates, target);
+    let problem_3 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let cs = CoinSelector::new(&problem_3);
     let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
     let mut rounds = 0;
@@ -151,7 +155,8 @@ proptest! {
             fee: TargetFee::ZERO,
             max_weight: None,
         };
-        let cs = CoinSelector::new(&candidates, target);
+        let problem_4 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let cs = CoinSelector::new(&problem_4);
         let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
         match solutions.enumerate().filter_map(|(i, sol)| Some((i, sol?))).last() {
@@ -184,12 +189,14 @@ proptest! {
         };
 
         let solution_weight = {
-            let mut cs = CoinSelector::new(&solution, target);
+            let problem_5 = SelectionProblem::new_no_ancestors(target, solution.iter().copied());
+            let mut cs = CoinSelector::new(&problem_5);
             cs.select_all();
             cs.input_weight()
         };
 
-        let mut cs = CoinSelector::new(&candidates, target);
+        let problem_6 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let mut cs = CoinSelector::new(&problem_6);
         for i in 0..num_preselected.min(solution_len) {
             cs.select(i);
         }
