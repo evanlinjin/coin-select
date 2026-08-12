@@ -212,10 +212,15 @@ impl<'a> CoinSelector<'a> {
     /// The fee (sats) this selection must pay *on top of* its own feerate obligation so the
     /// unconfirmed ancestors it drags in reach `target.fee.rate` (CPFP).
     ///
-    /// Computed over the [union](Self::selected_ancestors) of dragged-in ancestors — never by
-    /// summing [`SelectionProblem::local_bump`], which would charge a shared ancestor once per
-    /// candidate. Netted over that union, so an overpaying ancestor offsets an underpaying one, and
-    /// saturating at 0 (an ancestor that overpays never funds the child).
+    /// Charged over the ancestors this selection drags in, taken **once each** — never by summing
+    /// [`SelectionProblem::local_bump`], which would charge a shared ancestor once per candidate.
+    /// Weight and fee are netted across them, so an ancestor paying above the rate offsets one paying
+    /// below it, and the result saturates at 0 (an ancestor that overpays never funds the child).
+    ///
+    /// Most ancestors are reachable through a single candidate, and
+    /// [`SelectionProblem`] has already folded those into a per-candidate
+    /// [`private_ancestors`](SelectionProblem::private_ancestors) pair, so all this does is add them
+    /// up. Only ancestors several candidates can reach still need de-duplicating here.
     ///
     /// Note this makes funding **non-monotone**: selecting a candidate that drags in an
     /// underpaying ancestor can lower [`excess`](Self::excess). It also means the bump is not
@@ -225,7 +230,147 @@ impl<'a> CoinSelector<'a> {
         if !self.problem.has_ancestors() {
             return 0;
         }
-        self.problem.ancestor_bump(&self.selected_ancestors())
+
+        let (mut weight, mut fee) = (0_u64, 0_u64);
+        if self.problem.has_private_ancestors() {
+            for cand_index in self.selected.iter() {
+                let (private_weight, private_fee) = self.problem.private_ancestors(cand_index);
+                weight += private_weight;
+                fee += private_fee;
+            }
+        }
+
+        if self.problem.has_shared_ancestors() {
+            let shared = self.selected_shared_ancestors();
+            for anc_index in shared.iter() {
+                let (shared_weight, shared_fee) = self.problem.ancestors()[anc_index];
+                weight += shared_weight;
+                fee += shared_fee;
+            }
+        }
+
+        self.target()
+            .fee
+            .rate
+            .implied_fee_wu(weight)
+            .saturating_sub(fee)
+    }
+
+    /// The unconfirmed ancestors that are not dragged in yet but could still be, i.e. those of the
+    /// [`unselected`](Self::unselected) candidates. Respects [`ban`](Self::ban).
+    ///
+    /// These are exactly the ancestors a descendant of this selection can add.
+    pub fn addable_ancestors(&self) -> Bitset {
+        let mut union = Bitset::with_capacity(self.problem.ancestors().len());
+        if self.problem.has_ancestors() {
+            let already = self.selected_ancestors();
+            for cand_index in self.unselected_indices() {
+                for anc_index in self.problem.drags_in(cand_index).iter() {
+                    if !already.contains(anc_index) {
+                        union.insert(anc_index);
+                    }
+                }
+            }
+        }
+        union
+    }
+
+    /// A lower bound on the [`ancestor_bump`](Self::ancestor_bump) of this selection **and of every
+    /// selection extending it**.
+    ///
+    /// A descendant adds some of the [`addable_ancestors`](Self::addable_ancestors), which moves what
+    /// it owes by `Σ rate·weight(a) − fee(a)` over them. So the cheapest reachable case is the one
+    /// that picks up as much *surplus* (ancestors paying above the rate) as it can:
+    ///
+    /// ```text
+    /// bump(S ∪ D) >= max(0, rate·weight(S) − fee(S) − shed)
+    /// ```
+    ///
+    /// Surplus cannot be picked up ancestor by ancestor though, because ancestors arrive by selecting
+    /// a *candidate*, which drags in its whole transitive set. So `shed` accumulates per group that
+    /// must arrive together, which is exactly the split [`SelectionProblem`] already computed:
+    ///
+    /// - Ancestors only one candidate can reach ([`private_ancestors`]) are netted as a group, and
+    ///   contribute only if the group as a whole is in surplus. A chain whose tip overpays but which
+    ///   nets to a deficit therefore offers nothing.
+    /// - Ancestors several candidates can reach ([`shared_drags_in`]) are credited individually,
+    ///   since which candidate brings them — and what else it brings — is not pinned down.
+    ///
+    /// This is still a relaxation: those groups may not be reachable *together*, and reaching them at
+    /// all means adding candidates, which adds child weight and value. Both only push the real figure
+    /// up. When nothing reachable is in surplus it is exactly the current bump.
+    ///
+    /// Computed in floating point and floored, so it can sit a fraction of a satoshi below the exact
+    /// value — in the safe direction.
+    ///
+    /// [`private_ancestors`]: SelectionProblem::private_ancestors
+    /// [`shared_drags_in`]: SelectionProblem::shared_drags_in
+    pub fn ancestor_bump_lower_bound(&self) -> u64 {
+        if !self.problem.has_ancestors() {
+            return 0;
+        }
+        let spwu = self.target().fee.rate.spwu() as f64;
+        // What a group of ancestors still owes; negative means it pays above the target rate.
+        let owes = |(weight, fee): (u64, u64)| weight as f64 * spwu - fee as f64;
+
+        // Ancestors only one candidate can reach are netted as a group, so they need no
+        // de-duplicating: what this selection owes for them is a plain sum, and the most a descendant
+        // could shed is one group at a time.
+        let mut owed = 0.0;
+        let mut shed = 0.0;
+        if self.problem.has_private_ancestors() {
+            for cand_index in self.selected.iter() {
+                owed += owes(self.problem.private_ancestors(cand_index));
+            }
+            for cand_index in self.unselected_indices() {
+                shed += (-owes(self.problem.private_ancestors(cand_index))).max(0.0);
+            }
+        }
+
+        // Only ancestors several candidates can reach have to be gathered up, and they are credited
+        // individually since no single candidate owns them.
+        if self.problem.has_shared_ancestors() {
+            let selected_shared = self.selected_shared_ancestors();
+            for anc_index in selected_shared.iter() {
+                owed += owes(self.problem.ancestors()[anc_index]);
+            }
+
+            let mut addable_shared = Bitset::with_capacity(self.problem.ancestors().len());
+            for cand_index in self.unselected_indices() {
+                for anc_index in self.problem.shared_drags_in(cand_index).iter() {
+                    if !selected_shared.contains(anc_index) {
+                        addable_shared.insert(anc_index);
+                    }
+                }
+            }
+            for anc_index in addable_shared.iter() {
+                shed += (-owes(self.problem.ancestors()[anc_index])).max(0.0);
+            }
+        }
+
+        let bound = owed - shed;
+        if bound <= 0.0 {
+            0
+        } else {
+            bound as u64 // truncating a positive float is the floor, i.e. rounds down
+        }
+    }
+
+    /// The ancestors this selection drags in that several candidates could have dragged in, taken
+    /// once each. Empty unless [`SelectionProblem::has_shared_ancestors`].
+    fn selected_shared_ancestors(&self) -> Bitset {
+        let mut shared = Bitset::with_capacity(match self.problem.has_shared_ancestors() {
+            true => self.problem.ancestors().len(),
+            false => 0,
+        });
+        if self.problem.has_shared_ancestors() {
+            for cand_index in self.selected.iter() {
+                for anc_index in self.problem.shared_drags_in(cand_index).iter() {
+                    shared.insert(anc_index);
+                }
+            }
+        }
+        shared
     }
 
     /// Current weight of transaction implied by the selection.
@@ -372,23 +517,19 @@ impl<'a> CoinSelector<'a> {
             + self.ancestor_bump()
     }
 
-    /// A lower bound on the fee that this selection — and every selection extending it — must pay,
-    /// **ignoring** what the ancestors owe.
+    /// A lower bound on the fee that this selection — and every selection extending it — must pay.
     ///
     /// Every term is monotone in the tx weight and so can only grow as more inputs (or a drain) are
-    /// added, and [`ancestor_bump`](Self::ancestor_bump) is non-negative, so this floor holds for
-    /// the whole subtree. The bump is deliberately excluded: it is *not* monotone, so a descendant
-    /// can owe less than this selection does.
+    /// added. What the ancestors owe is *not* monotone, so this credits only
+    /// [`ancestor_bump_lower_bound`](Self::ancestor_bump_lower_bound) — the least any descendant
+    /// could owe — rather than this selection's actual [`ancestor_bump`](Self::ancestor_bump).
     ///
     /// Weight-unit (un-rounded) fees are used throughout, which can only make the floor smaller.
     pub(crate) fn fee_floor(&self) -> u64 {
         let weight = self.weight(self.target().outputs, DrainWeights::NONE);
-        let mut floor = self
-            .target()
-            .fee
-            .rate
-            .implied_fee_wu(weight)
-            .max(self.target().fee.absolute);
+        let mut floor = (self.target().fee.rate.implied_fee_wu(weight)
+            + self.ancestor_bump_lower_bound())
+        .max(self.target().fee.absolute);
         if let Some(replace) = self.target().fee.replace {
             floor = floor.max(replace.min_fee_to_do_replacement_wu(weight));
         }

@@ -23,7 +23,7 @@ use crate::{float::Ordf32, BnbMetric, CoinSelector, Drain, DrainWeights, FeeRate
 /// coins that drag in nothing (or that share an already-paid-for ancestor). The score itself is
 /// still the child transaction's fee — the bump is inside it, not added on top.
 ///
-/// The bound is much looser in that case (see [`bound`](BnbMetric::bound)): the tight bounds assume
+/// The bound is looser in that case (see [`bound`](BnbMetric::bound)): the tight bounds assume
 /// funding is monotone and that a candidate costs its own weight, neither of which survives shared
 /// or overpaying ancestors. Correctness is kept; the search just explores more.
 ///
@@ -151,8 +151,10 @@ impl BnbMetric for LowestFee {
         //   `None` returns would claim infeasibility off the back of "select everything and it's
         //   still unfunded", which no longer implies anything about subsets.
         //
-        // So fall back to the fee floor: monotone in weight, ignores the (non-monotone) bump
-        // entirely, and never claims infeasibility. Loose, but admissible.
+        // So fall back to the fee floor, which is monotone in weight and never claims
+        // infeasibility. It still credits what the ancestors owe, but only the least any descendant
+        // could owe (`CoinSelector::ancestor_bump_lower_bound`) rather than what this selection owes
+        // — which is the whole bump whenever no reachable ancestor overpays.
         if cs.problem().has_ancestors() {
             return Some(Ordf32(cs.fee_floor() as f32));
         }

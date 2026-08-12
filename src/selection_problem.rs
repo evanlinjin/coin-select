@@ -55,10 +55,10 @@ impl<Txid> From<Input<Txid>> for InputGroup<Txid> {
 /// mempool "mine" step — deficits are computed against the full ancestor set and may overestimate
 /// what Bitcoin Core would charge.
 ///
-/// What a selection actually owes is [`ancestor_bump`](Self::ancestor_bump) over the **union** of
-/// the ancestors its selected candidates drag in; see
-/// [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump), which is what fee and
-/// excess calculations use.
+/// What a selection actually owes is
+/// [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump): the shortfall of the
+/// ancestors its selected candidates drag in, each charged once, weight and fee netted over the
+/// union.
 #[derive(Debug, Clone)]
 pub struct SelectionProblem {
     target: Target,
@@ -66,11 +66,24 @@ pub struct SelectionProblem {
     /// Weight and fee of each ancestor, after txids are dropped.
     ancestors: Vec<(u64, u64)>,
     /// Per-candidate set of ancestor indices dragged in by selecting that candidate.
+    ///
+    /// Empty when the problem has no ancestors (see [`has_ancestors`](Self::has_ancestors)); use
+    /// [`drags_in`](Self::drags_in) rather than indexing this directly.
     drags_in: Vec<Bitset>,
-    /// Per-candidate local bump fee (sats) at [`Target::fee`](crate::TargetFee)'s rate.
-    local_bump: Vec<u64>,
-    /// Whether any candidate drags in at least one ancestor.
-    has_ancestors: bool,
+    /// Summed weight and fee of the ancestors *only* this candidate can drag in.
+    ///
+    /// No other candidate reaches them, so they arrive exactly when this candidate is selected.
+    /// Summed rather than reduced to a bump because the target rate must be applied to the total
+    /// weight of the whole selection once, and because an ancestor paying above the rate has to be
+    /// able to subsidize one paying below it.
+    private: Vec<(u64, u64)>,
+    /// [`drags_in`](Self::drags_in) restricted to ancestors reachable via several candidates, which
+    /// are the only ones that still need de-duplicating at selection time.
+    shared_drags_in: Vec<Bitset>,
+    /// Whether any ancestor is reachable via exactly one candidate.
+    has_private_ancestors: bool,
+    /// Whether any ancestor is reachable via more than one candidate.
+    has_shared_ancestors: bool,
 }
 
 /// The fee still owed so the ancestors in `set` meet `rate`, over the whole set at once.
@@ -100,17 +113,19 @@ impl SelectionProblem {
             candidates,
             ancestors: Vec::new(),
             drags_in: (0..n).map(|_| Bitset::with_capacity(0)).collect(),
-            local_bump: alloc::vec![0; n],
-            has_ancestors: false,
+            private: alloc::vec![(0, 0); n],
+            shared_drags_in: (0..n).map(|_| Bitset::with_capacity(0)).collect(),
+            has_private_ancestors: false,
+            has_shared_ancestors: false,
         }
     }
 
     /// Build candidates from input groups and the unconfirmed ancestors they may drag in.
     ///
     /// For each input group, the residing txids and their transitive parents (restricted to
-    /// `ancestors_to_bump`) form that candidate's `drags_in` set. `local_bump` is the fee still
-    /// owed so those ancestors meet `target.fee.rate`, as if this were the only selected
-    /// candidate — see [`local_bump`](Self::local_bump) for why that figure must not be summed.
+    /// `ancestors_to_bump`) form that candidate's `drags_in` set. Ancestors only one candidate can
+    /// reach are folded into [`private_ancestors`](Self::private_ancestors); the rest stay in
+    /// [`shared_drags_in`](Self::shared_drags_in) to be de-duplicated per selection.
     pub fn new<Txid, G, A>(target: Target, input_groups: G, ancestors_to_bump: A) -> Self
     where
         Txid: Copy + Ord + Eq,
@@ -132,8 +147,6 @@ impl SelectionProblem {
         let anc_weight_fee: Vec<(u64, u64)> = ancestors.iter().map(|a| (a.weight, a.fee)).collect();
         let mut candidates = Vec::new();
         let mut drags_in = Vec::new();
-        let mut local_bump = Vec::new();
-        let mut has_ancestors = false;
 
         for input_group in input_groups {
             let mut cand = Candidate {
@@ -162,10 +175,39 @@ impl SelectionProblem {
                 }
             }
 
-            has_ancestors |= !dragged.is_empty();
-            local_bump.push(bump_of(&anc_weight_fee, target.fee.rate, &dragged));
             candidates.push(cand);
             drags_in.push(dragged);
+        }
+
+        // An ancestor no other candidate can reach arrives exactly when this one is selected, so its
+        // weight and fee can be folded into the candidate now. The rest still have to be
+        // de-duplicated at selection time.
+        let mut reachable_by = alloc::vec![0_u32; n_anc];
+        for dragged in &drags_in {
+            for anc_i in dragged.iter() {
+                reachable_by[anc_i] += 1;
+            }
+        }
+        let mut private = Vec::with_capacity(drags_in.len());
+        let mut shared_drags_in = Vec::with_capacity(drags_in.len());
+        let mut has_private_ancestors = false;
+        let mut has_shared_ancestors = false;
+        for dragged in &drags_in {
+            let mut private_weight_fee = (0_u64, 0_u64);
+            let mut shared = Bitset::with_capacity(n_anc);
+            for anc_i in dragged.iter() {
+                if reachable_by[anc_i] == 1 {
+                    let (weight, fee) = anc_weight_fee[anc_i];
+                    private_weight_fee.0 += weight;
+                    private_weight_fee.1 += fee;
+                    has_private_ancestors = true;
+                } else {
+                    shared.insert(anc_i);
+                    has_shared_ancestors = true;
+                }
+            }
+            private.push(private_weight_fee);
+            shared_drags_in.push(shared);
         }
 
         Self {
@@ -173,8 +215,10 @@ impl SelectionProblem {
             candidates,
             ancestors: anc_weight_fee,
             drags_in,
-            local_bump,
-            has_ancestors,
+            private,
+            shared_drags_in,
+            has_private_ancestors,
+            has_shared_ancestors,
         }
     }
 
@@ -213,7 +257,7 @@ impl SelectionProblem {
     /// `false` means every fee calculation reduces to the plain (child-only) case, which lets
     /// branch and bound use the tighter bounds that assume monotone funding.
     pub fn has_ancestors(&self) -> bool {
-        self.has_ancestors
+        self.has_private_ancestors || self.has_shared_ancestors
     }
 
     /// Ancestor indices dragged in by selecting candidate `index`.
@@ -221,23 +265,47 @@ impl SelectionProblem {
         &self.drags_in[index]
     }
 
-    /// The fee still owed so the ancestors in `set` meet [`Target::fee`](crate::TargetFee)'s rate.
+    /// Summed `(weight, fee)` of the ancestors only candidate `index` can drag in.
     ///
-    /// `set` indexes [`ancestors`](Self::ancestors). Weight and fee are netted over the whole set,
-    /// so each ancestor is charged exactly once no matter how many candidates drag it in, and an
-    /// overpaying ancestor offsets an underpaying one. Saturates at 0.
-    pub fn ancestor_bump(&self, set: &Bitset) -> u64 {
-        bump_of(&self.ancestors, self.target.fee.rate, set)
+    /// Deliberately not reduced to a bump: the target rate applies to the total ancestor weight of
+    /// the whole selection at once, and an ancestor paying above the rate must be able to subsidize
+    /// one paying below it. See [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump).
+    pub fn private_ancestors(&self, index: usize) -> (u64, u64) {
+        self.private[index]
     }
 
-    /// Local (per-candidate) bump fee for candidate `index`, in satoshis.
+    /// [`drags_in`](Self::drags_in) restricted to the ancestors that several candidates can reach.
     ///
-    /// This is what candidate `index` would owe *on its own*. It is informational only: these
-    /// figures must never be summed over a selection, because candidates sharing an ancestor would
-    /// each pay for it. Use [`ancestor_bump`](Self::ancestor_bump) over the union instead (which is
-    /// what [`CoinSelector`] does).
+    /// Those are the only ones that can be dragged in twice over, so they are the only ones a
+    /// selection has to de-duplicate; the rest are folded into
+    /// [`private_ancestors`](Self::private_ancestors).
+    pub fn shared_drags_in(&self, index: usize) -> &Bitset {
+        &self.shared_drags_in[index]
+    }
+
+    /// Whether any ancestor is reachable via exactly one candidate.
+    ///
+    /// When `false`, every ancestor is shared and [`private_ancestors`](Self::private_ancestors) is
+    /// `(0, 0)` throughout, so summing it can be skipped.
+    pub fn has_private_ancestors(&self) -> bool {
+        self.has_private_ancestors
+    }
+
+    /// Whether any ancestor is reachable via more than one candidate.
+    ///
+    /// When `false`, what a selection owes is a plain sum over its selected candidates — nothing has
+    /// to be de-duplicated.
+    pub fn has_shared_ancestors(&self) -> bool {
+        self.has_shared_ancestors
+    }
+
+    /// The fee still owed so the ancestors only this candidate would drag in meet
+    /// [`Target::fee`](crate::TargetFee)'s rate, as if it were the only selected candidate.
+    ///
+    /// Informational: must never be summed over a selection (shared ancestors would be charged
+    /// twice). What a selection owes is [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump).
     pub fn local_bump(&self, index: usize) -> u64 {
-        self.local_bump[index]
+        bump_of(&self.ancestors, self.target.fee.rate, self.drags_in(index))
     }
 
     /// A [`CoinSelector`] over this problem.
