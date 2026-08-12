@@ -1,5 +1,4 @@
 #![allow(unused_imports)]
-
 mod common;
 use bdk_coin_select::metrics::{Changeless, LowestFee};
 use bdk_coin_select::{
@@ -85,8 +84,8 @@ proptest! {
             Candidate {
                 value: 20_000,
                 weight: (32 + 4 + 4 + 1) * 4 + 64 + 32,
-                input_count: 1,
-                is_segwit: true,
+                segwit_count: 1,
+                legacy_count: 0,
             };
             params.n_candidates
         ];
@@ -238,21 +237,21 @@ fn does_not_create_change_below_spend_cost() {
         Candidate {
             value: 100_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
         Candidate {
             value: 50_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
         // NOTE: this input has negative effective value
         Candidate {
             value: 10,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
     ];
 
@@ -321,14 +320,14 @@ fn zero_fee_tx() {
         Candidate {
             value: 100_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
         Candidate {
             value: 50_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
     ];
 
@@ -354,8 +353,8 @@ fn err_candidate(value: u64) -> Candidate {
     Candidate {
         value,
         weight: 272, // ~1 P2WPKH input
-        input_count: 1,
-        is_segwit: true,
+        segwit_count: 1,
+        legacy_count: 0,
     }
 }
 
