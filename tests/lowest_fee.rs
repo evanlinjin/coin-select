@@ -1,5 +1,4 @@
 #![allow(unused_imports)]
-
 mod common;
 use bdk_coin_select::metrics::{Changeless, LowestFee};
 use bdk_coin_select::{
@@ -85,8 +84,8 @@ proptest! {
             Candidate {
                 value: 20_000,
                 weight: (32 + 4 + 4 + 1) * 4 + 64 + 32,
-                input_count: 1,
-                is_segwit: true,
+                segwit_count: 1,
+                legacy_count: 0,
             };
             params.n_candidates
         ];
@@ -236,21 +235,21 @@ fn does_not_create_change_below_spend_cost() {
         Candidate {
             value: 100_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
         Candidate {
             value: 50_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
         // NOTE: this input has negative effective value
         Candidate {
             value: 10,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
     ];
 
@@ -314,14 +313,14 @@ fn zero_fee_tx() {
         Candidate {
             value: 100_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
         Candidate {
             value: 50_000,
             weight: 100,
-            input_count: 1,
-            is_segwit: true,
+            segwit_count: 1,
+            legacy_count: 0,
         },
     ];
 
@@ -346,8 +345,8 @@ fn err_candidate(value: u64) -> Candidate {
     Candidate {
         value,
         weight: 272, // ~1 P2WPKH input
-        input_count: 1,
-        is_segwit: true,
+        segwit_count: 1,
+        legacy_count: 0,
     }
 }
 
@@ -425,4 +424,52 @@ fn run_bnb_reports_round_limit() {
             rounds: 0,
         },
     );
+}
+
+/// A segwit and a legacy candidate with the same value and weight are *not* interchangeable: the
+/// segwit one adds the witness header to the tx, and the legacy one doesn't. So excluding one must
+/// not also ban the other, or branch and bound misses the cheaper (legacy-only) selection.
+#[test]
+fn does_not_ban_candidates_that_differ_only_in_script_type() {
+    let target = Target {
+        fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(10.0)),
+        outputs: TargetOutputs {
+            value_sum: 50_000,
+            weight_sum: 200 - TX_FIXED_FIELD_WEIGHT - 1,
+            n_outputs: 1,
+        },
+        max_weight: None,
+    };
+    let candidates = vec![
+        Candidate {
+            value: 100_000,
+            weight: 472,
+            segwit_count: 1,
+            legacy_count: 0,
+        },
+        Candidate {
+            value: 100_000,
+            weight: 472,
+            segwit_count: 0,
+            legacy_count: 1,
+        },
+    ];
+    let metric = LowestFee {
+        long_term_feerate: FeeRate::from_sat_per_vb(10.0),
+        dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
+        drain_weights: DrainWeights::TR_KEYSPEND,
+    };
+
+    let mut exhaustive = CoinSelector::new(&candidates, target);
+    let (best_score, _) =
+        common::exhaustive_search(&mut exhaustive, &mut metric.clone()).expect("solvable");
+    assert!(
+        exhaustive.is_selected(1) && !exhaustive.is_selected(0),
+        "legacy-only is the optimum: {}",
+        exhaustive
+    );
+
+    let mut cs = CoinSelector::new(&candidates, target);
+    let (score, _) = cs.run_bnb(metric, 100).expect("solvable");
+    assert_eq!(score, best_score, "bnb selected {}", cs);
 }
