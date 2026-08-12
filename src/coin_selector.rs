@@ -142,20 +142,23 @@ impl<'a> CoinSelector<'a> {
     /// The weight of the inputs including the witness header and the varint for the number of
     /// inputs.
     pub fn input_weight(&self) -> u64 {
-        let is_segwit_tx = self.selected().any(|(_, wv)| wv.is_segwit);
+        let is_segwit_tx = self.selected().any(|(_, wv)| wv.segwit_count > 0);
         let witness_header_extra_weight = is_segwit_tx as u64 * 2;
 
-        let input_count = self.selected().map(|(_, wv)| wv.input_count).sum::<usize>();
+        let input_count = self
+            .selected()
+            .map(|(_, wv)| wv.segwit_count + wv.legacy_count)
+            .sum::<usize>();
         let input_varint_weight = varint_size(input_count) * 4;
 
         let selected_weight: u64 = self
             .selected()
             .map(|(_, candidate)| {
                 let mut weight = candidate.weight;
-                if is_segwit_tx && !candidate.is_segwit {
-                    // non-segwit candidates do not have the witness length field included in their
-                    // weight field so we need to add 1 here if it's in a segwit tx.
-                    weight += 1;
+                if is_segwit_tx {
+                    // Legacy inputs do not have the witness length included in their weight field
+                    // so we need to add 1 to each if it's a segwit tx.
+                    weight += candidate.legacy_count as u64;
                 }
                 weight
             })
@@ -889,7 +892,11 @@ impl std::error::Error for NoBnbSolution {}
 
 /// A `Candidate` represents an input candidate for [`CoinSelector`].
 ///
-/// This can either be a single UTXO, or a group of UTXOs that should be spent together.
+/// This can either be a single UTXO, or a group of UTXOs that should be spent together. A group
+/// may mix legacy and segwit inputs; set [`legacy_count`] and [`segwit_count`] accordingly.
+///
+/// [`legacy_count`]: Candidate::legacy_count
+/// [`segwit_count`]: Candidate::segwit_count
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate {
     /// Total value of the UTXO(s) that this [`Candidate`] represents.
@@ -897,11 +904,24 @@ pub struct Candidate {
     /// Total weight of including this/these UTXO(s).
     /// `txin` fields: `prevout`, `nSequence`, `scriptSigLen`, `scriptSig`, `scriptWitnessLen`,
     /// `scriptWitness` should all be included.
+    ///
+    /// For legacy inputs, do *not* include the `scriptWitnessLen` byte: a legacy input only
+    /// serializes an (empty) witness when the transaction has a witness section, and
+    /// [`CoinSelector::input_weight`] adds that 1 WU per legacy input once any segwit input is
+    /// selected.
     pub weight: u64,
-    /// Total number of inputs; so we can calculate extra `varint` weight due to `vin` len changes.
-    pub input_count: usize,
-    /// Whether this [`Candidate`] contains at least one segwit spend.
-    pub is_segwit: bool,
+    /// Total number of segwit inputs.
+    ///
+    /// If any selected candidate has a non-zero `segwit_count`, the transaction serializes a
+    /// witness section (marker + flag, 2 WU) and every input — including legacy ones — pays for
+    /// a witness.
+    pub segwit_count: usize,
+    /// Total number of legacy (non-segwit) inputs.
+    ///
+    /// Each legacy input serializes an empty witness (1 WU) when the transaction has a witness
+    /// section; [`CoinSelector::input_weight`] prices this per legacy input, so grouped legacy
+    /// inputs are counted exactly.
+    pub legacy_count: usize,
 }
 
 impl Candidate {
@@ -920,8 +940,8 @@ impl Candidate {
         Candidate {
             value,
             weight,
-            input_count: 1,
-            is_segwit,
+            segwit_count: is_segwit as usize,
+            legacy_count: !is_segwit as usize,
         }
     }
 

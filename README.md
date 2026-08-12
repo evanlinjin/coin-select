@@ -33,23 +33,22 @@ let candidates = vec![
     Candidate {
         // How many inputs does this candidate represents. Needed so we can 
         // figure out the weight of the varint that encodes the number of inputs
-        input_count: 1,
+        // and whether segwit transaction fields need to be counted in.
+        segwit_count: 1,
+        legacy_count: 0,
         // the value of the input
         value: 1_000_000,
         // the total weight of the input(s) including their witness/scriptSig
         // you may need to use miniscript to figure out the correct value here.
         weight: TR_KEYSPEND_TXIN_WEIGHT,
-        // wether it's a segwit input. Needed so we know whether to include the
-        // segwit header in total weight calculations.
-        is_segwit: true
     },
     Candidate {
         // A candidate can represent multiple inputs in the case where you 
         // always want some inputs to be spent together.
-        input_count: 2,
+        segwit_count: 2,
+        legacy_count: 0,
         weight: 2*TR_KEYSPEND_TXIN_WEIGHT,
         value: 3_000_000,
-        is_segwit: true
     }
 ];
 
@@ -105,22 +104,22 @@ let outputs = vec![TxOut {
 
 let candidates = [
     Candidate {
-        input_count: 1,
+        segwit_count: 1,
+        legacy_count: 0,
         value: 400_000,
         weight: TR_KEYSPEND_TXIN_WEIGHT,
-        is_segwit: true
     },
     Candidate {
-        input_count: 1,
+        segwit_count: 1,
+        legacy_count: 0,
         value: 200_000,
         weight: TR_KEYSPEND_TXIN_WEIGHT,
-        is_segwit: true
     },
     Candidate {
-        input_count: 1,
+        segwit_count: 1,
+        legacy_count: 0,
         value: 11_000,
         weight: TR_KEYSPEND_TXIN_WEIGHT,
-        is_segwit: true
     }
 ];
 let drain_weights = bdk_coin_select::DrainWeights::default();

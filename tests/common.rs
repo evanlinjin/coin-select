@@ -269,14 +269,21 @@ pub fn gen_candidates(n: usize) -> Vec<Candidate> {
     core::iter::repeat_with(move || {
         let value = rng.random_range(1..500_001);
         let weight = rng.random_range(1..2001);
-        let input_count = rng.random_range(1..3);
-        let is_segwit = rng.random_bool(0.01);
+
+        let (mut legacy_count, mut segwit_count);
+        loop {
+            legacy_count = rng.random_range(0..3);
+            segwit_count = if rng.random_bool(0.01) { 1 } else { 0 };
+            if legacy_count > 0 || segwit_count > 0 {
+                break;
+            }
+        }
 
         Candidate {
             value,
             weight,
-            input_count,
-            is_segwit,
+            segwit_count,
+            legacy_count,
         }
     })
     .take(n)
