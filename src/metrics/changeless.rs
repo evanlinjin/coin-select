@@ -25,8 +25,17 @@ impl<M: BnbMetric> Changeless<M> {
     /// NOTE: this relies on candidates being sorted so that all negative effective value candidates
     /// are next to each other, which [`requires_ordering_by_descending_value_pwu`] guarantees.
     ///
+    /// NOTE: with unconfirmed ancestors this reasoning breaks down — a candidate's marginal cost is
+    /// not its own value and weight (it also drags in ancestors, possibly ones already paid for), so
+    /// the selection built here need not be the one with the smallest excess. We give up the prune
+    /// rather than risk discarding a branch that does contain a changeless solution.
+    ///
     /// [`requires_ordering_by_descending_value_pwu`]: BnbMetric::requires_ordering_by_descending_value_pwu
     fn change_unavoidable(&mut self, cs: &CoinSelector<'_>) -> bool {
+        if cs.problem().has_ancestors() {
+            return false;
+        }
+
         if self.0.drain(cs).is_none() {
             return false;
         }

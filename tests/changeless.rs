@@ -22,8 +22,7 @@ fn test_wv(mut rng: impl RngCore) -> impl Iterator<Item = Candidate> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-    })]
+    #![proptest_config(ProptestConfig::default())]
 
     #[test]
     #[cfg(not(debug_assertions))] // too slow if compiling for debug

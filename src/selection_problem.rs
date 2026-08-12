@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::bitset::Bitset;
-use crate::{Candidate, CoinSelector, Target};
+use crate::{Candidate, CoinSelector, FeeRate, Target};
 
 /// An unconfirmed ancestor that may need bumping to the target feerate (CPFP).
 ///
@@ -51,10 +51,14 @@ impl<Txid> From<Input<Txid>> for InputGroup<Txid> {
 /// [`CoinSelector::new`].
 ///
 /// Ancestor bump figures are stored here (not on [`Candidate`]) so candidates stay a plain
-/// description of inputs. They are not yet folded into fee/excess calculations; that is a
-/// follow-up. Unknown parent ids are treated as confirmed and ignored. There is no mempool
-/// "mine" step — deficits are computed against the full ancestor set and may overestimate
+/// description of inputs. Unknown parent ids are treated as confirmed and ignored. There is no
+/// mempool "mine" step — deficits are computed against the full ancestor set and may overestimate
 /// what Bitcoin Core would charge.
+///
+/// What a selection actually owes is [`ancestor_bump`](Self::ancestor_bump) over the **union** of
+/// the ancestors its selected candidates drag in; see
+/// [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump), which is what fee and
+/// excess calculations use.
 #[derive(Debug, Clone)]
 pub struct SelectionProblem {
     target: Target,
@@ -65,6 +69,20 @@ pub struct SelectionProblem {
     drags_in: Vec<Bitset>,
     /// Per-candidate local bump fee (sats) at [`Target::fee`](crate::TargetFee)'s rate.
     local_bump: Vec<u64>,
+    /// Whether any candidate drags in at least one ancestor.
+    has_ancestors: bool,
+}
+
+/// The fee still owed so the ancestors in `set` meet `rate`, over the whole set at once.
+///
+/// Weights and fees are netted across the set, so an overpaying ancestor subsidizes an underpaying
+/// one and the result saturates at 0 (the child is never credited).
+fn bump_of(ancestors: &[(u64, u64)], rate: FeeRate, set: &Bitset) -> u64 {
+    let (weight, fee) = set.iter().fold((0_u64, 0_u64), |(w, f), anc_i| {
+        let (anc_w, anc_f) = ancestors[anc_i];
+        (w + anc_w, f + anc_f)
+    });
+    rate.implied_fee_wu(weight).saturating_sub(fee)
 }
 
 impl SelectionProblem {
@@ -83,6 +101,7 @@ impl SelectionProblem {
             ancestors: Vec::new(),
             drags_in: (0..n).map(|_| Bitset::with_capacity(0)).collect(),
             local_bump: alloc::vec![0; n],
+            has_ancestors: false,
         }
     }
 
@@ -91,7 +110,7 @@ impl SelectionProblem {
     /// For each input group, the residing txids and their transitive parents (restricted to
     /// `ancestors_to_bump`) form that candidate's `drags_in` set. `local_bump` is the fee still
     /// owed so those ancestors meet `target.fee.rate`, as if this were the only selected
-    /// candidate.
+    /// candidate — see [`local_bump`](Self::local_bump) for why that figure must not be summed.
     pub fn new<Txid, G, A>(target: Target, input_groups: G, ancestors_to_bump: A) -> Self
     where
         Txid: Copy + Ord + Eq,
@@ -110,9 +129,11 @@ impl SelectionProblem {
             .collect();
 
         let n_anc = ancestors.len();
+        let anc_weight_fee: Vec<(u64, u64)> = ancestors.iter().map(|a| (a.weight, a.fee)).collect();
         let mut candidates = Vec::new();
         let mut drags_in = Vec::new();
         let mut local_bump = Vec::new();
+        let mut has_ancestors = false;
 
         for input_group in input_groups {
             let mut cand = Candidate {
@@ -141,23 +162,19 @@ impl SelectionProblem {
                 }
             }
 
-            let (w, f) = dragged.iter().fold((0_u64, 0_u64), |(w, f), anc_i| {
-                let a = &ancestors[anc_i];
-                (w + a.weight, f + a.fee)
-            });
-            let bump = target.fee.rate.implied_fee_wu(w).saturating_sub(f);
-
+            has_ancestors |= !dragged.is_empty();
+            local_bump.push(bump_of(&anc_weight_fee, target.fee.rate, &dragged));
             candidates.push(cand);
             drags_in.push(dragged);
-            local_bump.push(bump);
         }
 
         Self {
             target,
             candidates,
-            ancestors: ancestors.into_iter().map(|a| (a.weight, a.fee)).collect(),
+            ancestors: anc_weight_fee,
             drags_in,
             local_bump,
+            has_ancestors,
         }
     }
 
@@ -191,12 +208,34 @@ impl SelectionProblem {
         &self.ancestors
     }
 
+    /// Whether any candidate drags in an unconfirmed ancestor.
+    ///
+    /// `false` means every fee calculation reduces to the plain (child-only) case, which lets
+    /// branch and bound use the tighter bounds that assume monotone funding.
+    pub fn has_ancestors(&self) -> bool {
+        self.has_ancestors
+    }
+
     /// Ancestor indices dragged in by selecting candidate `index`.
     pub fn drags_in(&self, index: usize) -> &Bitset {
         &self.drags_in[index]
     }
 
+    /// The fee still owed so the ancestors in `set` meet [`Target::fee`](crate::TargetFee)'s rate.
+    ///
+    /// `set` indexes [`ancestors`](Self::ancestors). Weight and fee are netted over the whole set,
+    /// so each ancestor is charged exactly once no matter how many candidates drag it in, and an
+    /// overpaying ancestor offsets an underpaying one. Saturates at 0.
+    pub fn ancestor_bump(&self, set: &Bitset) -> u64 {
+        bump_of(&self.ancestors, self.target.fee.rate, set)
+    }
+
     /// Local (per-candidate) bump fee for candidate `index`, in satoshis.
+    ///
+    /// This is what candidate `index` would owe *on its own*. It is informational only: these
+    /// figures must never be summed over a selection, because candidates sharing an ancestor would
+    /// each pay for it. Use [`ancestor_bump`](Self::ancestor_bump) over the union instead (which is
+    /// what [`CoinSelector`] does).
     pub fn local_bump(&self, index: usize) -> u64 {
         self.local_bump[index]
     }
