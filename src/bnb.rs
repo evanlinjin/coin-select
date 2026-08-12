@@ -137,12 +137,19 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         inclusion_cs.select(next_index);
         self.consider_adding_to_queue(&inclusion_cs, false);
 
-        // for the exclusion branch, we keep banning if candidates have the same weight and value
+        // For the exclusion branch, we keep banning candidates that are interchangeable with the one
+        // we just excluded: same value and weight, and dragging in exactly the same unconfirmed
+        // ancestors (two coins of equal value and weight are *not* interchangeable if one of them
+        // drags in an ancestor that needs bumping). Candidates are only compared until the first
+        // mismatch, since this exploits them being adjacent in the sorted order.
         let mut is_first_ban = true;
         let mut exclusion_cs = cs.clone();
         let to_ban = (next.value, next.weight);
+        let to_ban_drags_in = cs.problem().drags_in(next_index);
         for (next_index, next) in cs.unselected() {
-            if (next.value, next.weight) != to_ban {
+            if (next.value, next.weight) != to_ban
+                || cs.problem().drags_in(next_index) != to_ban_drags_in
+            {
                 break;
             }
             let (_index, _candidate) = exclusion_cs

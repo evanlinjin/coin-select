@@ -129,11 +129,17 @@ impl<'a> CoinSelector<'a> {
     /// enough value is reachable for [`is_funded`] to hold. Respects [`ban`]ned candidates.
     ///
     /// Selecting *all* effective inputs maximizes the value available, so if that can't meet the
-    /// target value, nothing can. Monotone, hence exact.
+    /// target value, nothing can.
     ///
     /// NOTE: this does **not** account for [`Target::max_weight`] — a `true` result can still be
     /// infeasible under the weight cap. Use [`select_until_target_met`] or branch and bound (both of
     /// which enforce the cap) to actually build a selection.
+    ///
+    /// NOTE: this is exact only when [`SelectionProblem::has_ancestors`] is `false`. With
+    /// unconfirmed ancestors, funding is not monotone (an input can drag in an ancestor that costs
+    /// more than the input is worth, and inputs sharing an ancestor pay for it once between them),
+    /// so the all-effective selection is no longer guaranteed to be the best case: this becomes a
+    /// heuristic and can answer either way. Use branch and bound to decide feasibility exactly.
     ///
     /// [`ban`]: Self::ban
     /// [`is_funded`]: Self::is_funded
@@ -185,6 +191,43 @@ impl<'a> CoinSelector<'a> {
             .sum()
     }
 
+    /// The unconfirmed ancestors the current selection drags in (indices into
+    /// [`SelectionProblem::ancestors`]).
+    ///
+    /// This is the **union** over the selected candidates, so an ancestor shared by several of them
+    /// appears once. Derived from `selected` on demand: deselecting a candidate keeps an ancestor
+    /// that another selected candidate still drags in.
+    pub fn selected_ancestors(&self) -> Bitset {
+        let mut union = Bitset::with_capacity(self.problem.ancestors().len());
+        if self.problem.has_ancestors() {
+            for cand_index in self.selected.iter() {
+                for anc_index in self.problem.drags_in(cand_index).iter() {
+                    union.insert(anc_index);
+                }
+            }
+        }
+        union
+    }
+
+    /// The fee (sats) this selection must pay *on top of* its own feerate obligation so the
+    /// unconfirmed ancestors it drags in reach `target.fee.rate` (CPFP).
+    ///
+    /// Computed over the [union](Self::selected_ancestors) of dragged-in ancestors — never by
+    /// summing [`SelectionProblem::local_bump`], which would charge a shared ancestor once per
+    /// candidate. Netted over that union, so an overpaying ancestor offsets an underpaying one, and
+    /// saturating at 0 (an ancestor that overpays never funds the child).
+    ///
+    /// Note this makes funding **non-monotone**: selecting a candidate that drags in an
+    /// underpaying ancestor can lower [`excess`](Self::excess). It also means the bump is not
+    /// additive over candidates, and a descendant selection can owe *less* than its parent (by
+    /// dragging in an ancestor that already overpays).
+    pub fn ancestor_bump(&self) -> u64 {
+        if !self.problem.has_ancestors() {
+            return 0;
+        }
+        self.problem.ancestor_bump(&self.selected_ancestors())
+    }
+
     /// Current weight of transaction implied by the selection.
     ///
     /// If you don't have any drain outputs (only target outputs) just set drain_weights to
@@ -217,6 +260,8 @@ impl<'a> CoinSelector<'a> {
 
     /// How much the current selection overshoots the value need to satisfy `self.target().fee.rate` and
     /// `self.target().value` (while ignoring `self.target().fee.absolute`).
+    ///
+    /// The feerate obligation includes the [`ancestor_bump`](Self::ancestor_bump).
     pub fn rate_excess(&self, drain: Drain) -> i64 {
         self.selected_value() as i64
             - self.target().value() as i64
@@ -272,6 +317,9 @@ impl<'a> CoinSelector<'a> {
     /// The feerate the transaction would have if we were to use this selection of inputs to achieve
     /// the `target`'s value and weight. It is essentially telling you what target feerate you currently have.
     ///
+    /// This is the *child* transaction's feerate: the fee and weight of any unconfirmed ancestors
+    /// this selection drags in are not included, so it is not the package feerate.
+    ///
     /// Returns `None` if the feerate would be negative or infinity.
     pub fn implied_feerate(&self, target_outputs: TargetOutputs, drain: Drain) -> Option<FeeRate> {
         let numerator =
@@ -287,6 +335,9 @@ impl<'a> CoinSelector<'a> {
     ///
     /// This compares the fee calculated from the target feerate with the fee calculated from the
     /// [`Replace`] constraints and returns the larger of the two.
+    ///
+    /// The feerate component includes the [`ancestor_bump`](Self::ancestor_bump); the absolute and
+    /// replacement components are child-transaction constraints and are left alone.
     ///
     /// `drain_weight` can be 0 to indicate no draining output.
     pub fn implied_fee(&self, drain_weights: DrainWeights) -> u64 {
@@ -310,6 +361,7 @@ impl<'a> CoinSelector<'a> {
             .fee
             .rate
             .implied_fee(self.weight(self.target().outputs, drain_weights))
+            + self.ancestor_bump()
     }
 
     fn implied_fee_from_feerate_wu(&self, drain_weights: DrainWeights) -> u64 {
@@ -317,6 +369,30 @@ impl<'a> CoinSelector<'a> {
             .fee
             .rate
             .implied_fee_wu(self.weight(self.target().outputs, drain_weights))
+            + self.ancestor_bump()
+    }
+
+    /// A lower bound on the fee that this selection — and every selection extending it — must pay,
+    /// **ignoring** what the ancestors owe.
+    ///
+    /// Every term is monotone in the tx weight and so can only grow as more inputs (or a drain) are
+    /// added, and [`ancestor_bump`](Self::ancestor_bump) is non-negative, so this floor holds for
+    /// the whole subtree. The bump is deliberately excluded: it is *not* monotone, so a descendant
+    /// can owe less than this selection does.
+    ///
+    /// Weight-unit (un-rounded) fees are used throughout, which can only make the floor smaller.
+    pub(crate) fn fee_floor(&self) -> u64 {
+        let weight = self.weight(self.target().outputs, DrainWeights::NONE);
+        let mut floor = self
+            .target()
+            .fee
+            .rate
+            .implied_fee_wu(weight)
+            .max(self.target().fee.absolute);
+        if let Some(replace) = self.target().fee.replace {
+            floor = floor.max(replace.min_fee_to_do_replacement_wu(weight));
+        }
+        floor
     }
 
     /// The actual fee the selection would pay if it was used in a transaction that had
@@ -328,6 +404,9 @@ impl<'a> CoinSelector<'a> {
     }
 
     /// The value of the current selected inputs minus the fee needed to pay for the selected inputs
+    ///
+    /// Only the selected inputs' own weight is charged; any [`ancestor_bump`](Self::ancestor_bump)
+    /// they drag in is not.
     pub fn effective_value(&self, feerate: FeeRate) -> i64 {
         self.selected_value() as i64 - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
     }
@@ -485,19 +564,22 @@ impl<'a> CoinSelector<'a> {
     /// Whether the selection covers the target value (i.e. [`excess`](Self::excess) is
     /// non-negative), ignoring [`Target::max_weight`].
     ///
-    /// This is **monotone**: selecting more never un-meets it. It deliberately does *not* include
-    /// the weight cap — see [`is_within_max_weight`](Self::is_within_max_weight).
+    /// This is **monotone** — selecting more never un-meets it — *unless* the problem has
+    /// unconfirmed ancestors, in which case adding an input can drag in an ancestor whose bump
+    /// exceeds the input's value (see [`ancestor_bump`](Self::ancestor_bump)). It deliberately does
+    /// not include the weight cap — see [`is_within_max_weight`](Self::is_within_max_weight).
     pub fn is_funded_with_drain(&self, drain: Drain) -> bool {
         self.excess(drain) >= 0
     }
 
     /// Whether the selection covers the target **value** (net of input fees), i.e. [`excess`] is
-    /// non-negative. **Monotone** (selecting more never un-meets it), and it deliberately does
-    /// *not* check [`Target::max_weight`] — that is the separate, anti-monotone
-    /// [`is_within_max_weight`]. See [`is_funded_with_drain`] for the version that
-    /// accounts for a specific `drain`.
+    /// non-negative. Monotone unless the problem has unconfirmed ancestors (see
+    /// [`is_funded_with_drain`] and [`ancestor_bump`]), and it deliberately does *not* check
+    /// [`Target::max_weight`] — that is the separate, anti-monotone [`is_within_max_weight`]. See
+    /// [`is_funded_with_drain`] for the version that accounts for a specific `drain`.
     ///
     /// [`excess`]: Self::excess
+    /// [`ancestor_bump`]: Self::ancestor_bump
     /// [`is_within_max_weight`]: Self::is_within_max_weight
     /// [`is_funded_with_drain`]: Self::is_funded_with_drain
     pub fn is_funded(&self) -> bool {
@@ -561,6 +643,10 @@ impl<'a> CoinSelector<'a> {
     /// Select all candidates with an *effective value* greater than 0 at the provided `feerate`.
     ///
     /// A candidate if effective if it provides more value than it takes to pay for at `feerate`.
+    ///
+    /// This looks at each candidate's own value and weight only: a candidate that pays for itself
+    /// but drags in an unconfirmed ancestor still counts as effective, even if the resulting
+    /// [`ancestor_bump`](Self::ancestor_bump) outweighs it.
     pub fn select_all_effective(&mut self, feerate: FeeRate) {
         for i in 0..self.candidate_order.len() {
             let cand_index = self.candidate_order[i];
@@ -582,6 +668,10 @@ impl<'a> CoinSelector<'a> {
     /// - [`SelectError::MaxWeightExceeded`] if the value is met but the resulting selection exceeds
     ///   [`Target::max_weight`]. Note this only reflects *this* in-order greedy selection; a
     ///   different selection might still fit the cap (use branch and bound to search for one).
+    ///
+    /// With unconfirmed ancestors the same caveat applies to
+    /// [`SelectError::InsufficientFunds`]: selecting everything can fail to meet the target while
+    /// some subset (one that drags in fewer ancestors) would meet it.
     pub fn select_until_target_met(&mut self) -> Result<(), SelectError> {
         self.select_until(|cs| cs.is_funded()).ok_or_else(|| {
             SelectError::InsufficientFunds(InsufficientFunds {
@@ -719,7 +809,8 @@ impl<'a> CoinSelector<'a> {
         // No solution. If the iterator still has an item we stopped at the round limit and a
         // solution may still exist with a larger `max_rounds`. Otherwise the tree was fully
         // explored, so no selection satisfies the target — a genuine infeasibility, split into
-        // value vs weight.
+        // value vs weight. (With unconfirmed ancestors `is_fundable` is only a heuristic, so the
+        // split between the two can be wrong — the infeasibility itself is not.)
         if iter.next().is_some() {
             assert_eq!(rounds, max_rounds); // still-yielding ⟹ we truncated at the cap
             return Err(NoBnbSolution::RoundLimit { max_rounds, rounds });
@@ -834,6 +925,10 @@ impl std::error::Error for SelectError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoBnbSolution {
     /// The candidates can't cover the target value, so no selection is possible.
+    ///
+    /// With unconfirmed ancestors this is decided by the heuristic [`CoinSelector::is_fundable`], so
+    /// it may be reported where [`MaxWeightExceeded`](Self::MaxWeightExceeded) fits better, and vice
+    /// versa. Either way the search was exhaustive: there is no solution.
     InsufficientFunds,
     /// Some selection covers the target value, but every one of them exceeds
     /// [`Target::max_weight`].

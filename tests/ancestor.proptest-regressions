@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 89e69058dd34f3215542f3ec44fbccc338577a6bfab488505a5e83dc5c1e88f6 # shrinks to spec = AncestorProblemSpec { candidates: [(1000, 200, 0), (1000, 200, 4)], ancestors: [(200, 0, 0)], target_value: 10000, feerate: 1.0, max_weight: None }
