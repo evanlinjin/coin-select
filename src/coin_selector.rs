@@ -928,20 +928,42 @@ impl Candidate {
     /// Create a [`Candidate`] input that spends a single taproot keyspend output.
     pub fn new_tr_keyspend(value: u64) -> Self {
         let weight = TR_KEYSPEND_SATISFACTION_WEIGHT;
-        Self::new(value, weight, true)
+        Self::new_segwit(value, weight)
     }
 
-    /// Create a new [`Candidate`] that represents a single input.
+    /// Create a new [`Candidate`] that represents a single segwit input.
     ///
-    /// `satisfaction_weight` is the weight of `scriptSigLen + scriptSig + scriptWitnessLen +
-    /// scriptWitness`.
-    pub fn new(value: u64, satisfaction_weight: u64, is_segwit: bool) -> Candidate {
+    /// `satisfaction_weight` is the additional weight (in weight units) required to satisfy the input
+    /// beyond [`TXIN_BASE_WEIGHT`] (e.g. `scriptWitnessLen + scriptWitness` in WU at 1 WU/byte, plus
+    /// any `scriptSig` data and extra `scriptSigLen` varint bytes if nested/wrapped segwit).
+    ///
+    /// Note that [`TXIN_BASE_WEIGHT`] already accounts for the outpoint, `nSequence`, and 1 byte for
+    /// `scriptSigLen`.
+    pub fn new_segwit(value: u64, satisfaction_weight: u64) -> Candidate {
         let weight = TXIN_BASE_WEIGHT + satisfaction_weight;
         Candidate {
             value,
             weight,
-            segwit_count: is_segwit as usize,
-            legacy_count: !is_segwit as usize,
+            segwit_count: 1,
+            legacy_count: 0,
+        }
+    }
+
+    /// Create a new [`Candidate`] that represents a single legacy (non-segwit) input.
+    ///
+    /// `satisfaction_weight` is the additional weight (in weight units) required to satisfy the input
+    /// beyond [`TXIN_BASE_WEIGHT`] (e.g. `scriptSig` at 4 WU/byte, plus 4 WU per extra `scriptSigLen`
+    /// varint byte if `scriptSig` exceeds 252 bytes).
+    ///
+    /// Note that [`TXIN_BASE_WEIGHT`] already accounts for the outpoint, `nSequence`, and 1 byte for
+    /// `scriptSigLen`.
+    pub fn new_legacy(value: u64, satisfaction_weight: u64) -> Candidate {
+        let weight = TXIN_BASE_WEIGHT + satisfaction_weight;
+        Candidate {
+            value,
+            weight,
+            segwit_count: 0,
+            legacy_count: 1,
         }
     }
 
