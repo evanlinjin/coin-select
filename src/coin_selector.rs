@@ -130,31 +130,6 @@ impl<'a> CoinSelector<'a> {
         self.selected.contains(index)
     }
 
-    /// Whether the candidates can cover this `target`'s **value** (net of input fees) — i.e. whether
-    /// enough value is reachable for [`is_funded`] to hold. Respects [`ban`]ned candidates.
-    ///
-    /// Selecting *all* effective inputs maximizes the value available, so if that can't meet the
-    /// target value, nothing can.
-    ///
-    /// NOTE: this does **not** account for [`Target::max_weight`] — a `true` result can still be
-    /// infeasible under the weight cap. Use [`select_until_target_met`] or branch and bound (both of
-    /// which enforce the cap) to actually build a selection.
-    ///
-    /// NOTE: this is exact only when [`SelectionProblem::has_ancestors`] is `false`. With
-    /// unconfirmed ancestors, funding is not monotone (an input can drag in an ancestor that costs
-    /// more than the input is worth, and inputs sharing an ancestor pay for it once between them),
-    /// so the all-effective selection is no longer guaranteed to be the best case: this becomes a
-    /// heuristic and can answer either way. Use branch and bound to decide feasibility exactly.
-    ///
-    /// [`ban`]: Self::ban
-    /// [`is_funded`]: Self::is_funded
-    /// [`select_until_target_met`]: Self::select_until_target_met
-    pub fn is_fundable(&self) -> bool {
-        let mut test = self.clone();
-        test.select_all_effective(self.target().fee.rate);
-        test.is_funded()
-    }
-
     /// Returns true if no candidates have been selected.
     pub fn is_empty(&self) -> bool {
         self.selected.is_empty()
@@ -946,7 +921,7 @@ impl<'a> CoinSelector<'a> {
             assert_eq!(rounds, max_rounds); // still-yielding ⟹ we truncated at the cap
             return Err(NoBnbSolution::RoundLimit { max_rounds, rounds });
         }
-        if !self.is_fundable() {
+        if !self.compute_view().is_fundable() {
             return Err(NoBnbSolution::InsufficientFunds);
         }
         Err(NoBnbSolution::MaxWeightExceeded)
@@ -1057,9 +1032,10 @@ impl std::error::Error for SelectError {}
 pub enum NoBnbSolution {
     /// The candidates can't cover the target value, so no selection is possible.
     ///
-    /// With unconfirmed ancestors this is decided by the heuristic [`CoinSelector::is_fundable`], so
-    /// it may be reported where [`MaxWeightExceeded`](Self::MaxWeightExceeded) fits better, and vice
-    /// versa. Either way the search was exhaustive: there is no solution.
+    /// With unconfirmed ancestors this is decided by the heuristic
+    /// [`SelectionView::is_fundable`](crate::SelectionView::is_fundable), so it may be reported where
+    /// [`MaxWeightExceeded`](Self::MaxWeightExceeded) fits better, and vice versa. Either way the
+    /// search was exhaustive: there is no solution.
     InsufficientFunds,
     /// Some selection covers the target value, but every one of them exceeds
     /// [`Target::max_weight`].

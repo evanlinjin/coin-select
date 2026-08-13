@@ -172,6 +172,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         // drags in an ancestor that needs bumping). Candidates are only compared until the first
         // mismatch, since this exploits them being adjacent in the sorted order.
         let mut exclusion_cs = cs.clone();
+        let mut exclusion_cache = cache.clone();
         let to_ban = (
             next.value,
             next.weight,
@@ -180,6 +181,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         );
         let to_ban_drags_in = cs.problem().drags_in(next_index);
         exclusion_cs.ban(next_index);
+        exclusion_cache.ban(cs.problem(), next_index);
         let mut exclusion_cursor = cursor + 1;
         for (next_index, next) in iter {
             if cs.is_selected(next_index) || cs.banned().contains(next_index) {
@@ -197,9 +199,10 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
                 break;
             }
             exclusion_cs.ban(next_index);
+            exclusion_cache.ban(cs.problem(), next_index);
             exclusion_cursor += 1;
         }
-        self.consider_adding_to_queue(&exclusion_cs, cache, true, exclusion_cursor);
+        self.consider_adding_to_queue(&exclusion_cs, &exclusion_cache, true, exclusion_cursor);
     }
 }
 

@@ -11,47 +11,6 @@ pub struct Changeless<M>(
     pub M,
 );
 
-impl<M: BnbMetric> Changeless<M> {
-    /// Whether every selection reachable down this branch (the current one and any superset of it)
-    /// would have a change output according to the inner metric — so no changeless solution exists
-    /// here and the branch can be pruned.
-    ///
-    /// The inner metric only adds change once the excess is large enough (we assume its change
-    /// decision is monotone in the excess). So the reachable selection least likely to have change
-    /// is the one with the smallest excess — the current selection plus every remaining
-    /// negative-effective-value candidate, since each of those lowers the excess. If even that
-    /// selection still has change, then so does every reachable selection.
-    ///
-    /// NOTE: this relies on candidates being sorted so that all negative effective value candidates
-    /// are next to each other, which [`requires_ordering_by_descending_value_pwu`] guarantees.
-    ///
-    /// NOTE: with unconfirmed ancestors this reasoning breaks down — a candidate's marginal cost is
-    /// not its own value and weight (it also drags in ancestors, possibly ones already paid for), so
-    /// the selection built here need not be the one with the smallest excess. We give up the prune
-    /// rather than risk discarding a branch that does contain a changeless solution.
-    ///
-    /// [`requires_ordering_by_descending_value_pwu`]: BnbMetric::requires_ordering_by_descending_value_pwu
-    fn change_unavoidable(&mut self, cs: &SelectionView<'_>) -> bool {
-        if cs.problem().has_ancestors() {
-            return false;
-        }
-
-        if self.0.drain(cs).is_none() {
-            return false;
-        }
-
-        let mut least_excess = cs.clone();
-        cs.unselected()
-            .rev()
-            .take_while(|(_, wv)| wv.effective_value(cs.target().fee.rate) < 0.0)
-            .for_each(|(index, _)| {
-                least_excess.add(index);
-            });
-
-        self.0.drain(&least_excess).is_some()
-    }
-}
-
 impl<M: BnbMetric> BnbMetric for Changeless<M> {
     fn drain(&mut self, _cs: &SelectionView<'_>) -> Drain {
         // by definition a changeless selection never has a change output
@@ -72,17 +31,14 @@ impl<M: BnbMetric> BnbMetric for Changeless<M> {
     }
 
     fn bound(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
-        if self.change_unavoidable(cs) {
-            // every descendant has change, so no changeless solution is reachable
-            None
-        } else {
-            // the changeless-constrained optimum is no better than the inner metric's unconstrained
-            // optimum, so the inner bound is a valid lower bound
-            self.0.bound(cs)
-        }
+        // The changeless-constrained optimum is no better than the inner metric's unconstrained
+        // optimum, so the inner bound is a valid lower bound. Change-unavoidability pruning is not
+        // generally sound because candidate marginal fees depend on vbyte rounding, RBF, framing,
+        // and ancestry.
+        self.0.bound(cs)
     }
 
     fn requires_ordering_by_descending_value_pwu(&self) -> bool {
-        true
+        self.0.requires_ordering_by_descending_value_pwu()
     }
 }

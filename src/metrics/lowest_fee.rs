@@ -308,7 +308,7 @@ impl BnbMetric for LowestFee {
             let mut unselected = cs.unselected();
             let (resize_index, to_resize) = loop {
                 let (index, candidate) = unselected.next()?;
-                local.add(index);
+                local.add_unchecked(index);
                 if local.is_funded() {
                     break (index, candidate);
                 }
@@ -318,7 +318,7 @@ impl BnbMetric for LowestFee {
             if local.excess(Drain::NONE) == 0 {
                 return Some(self.fee_score(&local).unwrap().0);
             };
-            local.sub(resize_index);
+            local.sub_unchecked(resize_index);
             let cs = &local;
 
             // We need to find the minimum fee we'd pay if we satisfy the feerate constraint. We do

@@ -92,7 +92,7 @@ proptest! {
         let mut cs = CoinSelector::new(&problem);
 
         let metric = params.lowest_fee_metric();
-        let is_impossible = !cs.is_fundable();
+        let is_impossible = !cs.compute_view().is_fundable();
         match common::bnb_search(&mut cs, metric, params.n_candidates * 10) {
             Ok((score, rounds)) => {
                 // the +1 is because the iterator will always try selecting nothing as a solution so we have
