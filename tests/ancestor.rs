@@ -10,7 +10,7 @@ mod common;
 
 use bdk_coin_select::{
     float::Ordf32,
-    metrics::{Changeless, LowestFee},
+    metrics::{LowestFee, LowestFeeChangeless},
     AncestorToBump, BnbMetric, Candidate, CoinSelector, Drain, DrainWeights, FeeRate, Input,
     Replace, SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
 };
@@ -328,13 +328,11 @@ fn score_is_the_childs_fee_which_already_covers_the_bump() {
 }
 
 /// A changeless solution can be reachable *only* by adding a coin whose ancestor eats the excess,
-/// which the `Changeless` wrapper's prune cannot see.
+/// which a changeless bound must account for.
 ///
-/// That prune asks "does the reachable selection with the least excess still have change?", and
-/// builds it by adding the remaining coins with negative effective value. Here the coin that kills
-/// the change looks profitable on its own (1000 sats for 200 wu) — it only shrinks the excess
-/// because it drags in an ancestor owing 10_800 sats. So the prune concludes change is unavoidable
-/// and would discard the one changeless solution there is.
+/// Here the coin that kills the change looks profitable on its own (1000 sats for 200 wu). It only
+/// shrinks the excess because it drags in an ancestor owing 10_800 sats, so a bound cannot assume
+/// excess is monotone or infer that change is unavoidable from standalone effective values.
 #[test]
 fn changeless_solution_reachable_only_via_an_ancestor_is_not_pruned() {
     let t = target(1.0, 100_000);
@@ -386,7 +384,7 @@ fn changeless_solution_reachable_only_via_an_ancestor_is_not_pruned() {
     // that has change.
     let mut cs = problem.selector();
     let (score, drain) = cs
-        .run_bnb(Changeless(metric()), 100_000)
+        .run_bnb(LowestFeeChangeless::from(metric()), 100_000)
         .expect("the changeless solution must not be pruned");
     assert!(drain.is_none());
     assert!(cs.is_selected(0) && cs.is_selected(1));
@@ -1078,26 +1076,19 @@ proptest! {
         }
     }
 
-    /// Same for the changeless-constrained metric, whose extra prune ("every reachable selection
-    /// would have change") also leans on a candidate costing only its own weight.
-    ///
-    /// NOTE: `max_weight` is forced off here. `Changeless<LowestFee>` disagrees with brute force on
-    /// capped problems *without* any ancestors too (`LowestFee` reports a selection as changeless
-    /// when change would bust the cap, a route to changelessness that `Changeless`'s
-    /// excess-monotone prune doesn't consider), so that is a separate, pre-existing issue rather
-    /// than something ancestors introduce.
+    /// Same for the dedicated changeless metric, including capped problems.
     #[test]
     fn changeless_bnb_finds_the_brute_force_optimum(
-        spec in spec_strategy().prop_map(|spec| AncestorProblemSpec { max_weight: None, ..spec }),
+        spec in spec_strategy(),
     ) {
         let problem = spec.build();
 
         let mut exhaustive_cs = problem.selector();
-        let mut exhaustive_metric = Changeless(metric());
+        let mut exhaustive_metric = LowestFeeChangeless::from(metric());
         let expected = common::exhaustive_search(&mut exhaustive_cs, &mut exhaustive_metric);
 
         let mut bnb_cs = problem.selector();
-        let found = common::bnb_search(&mut bnb_cs, Changeless(metric()), usize::MAX);
+        let found = common::bnb_search(&mut bnb_cs, LowestFeeChangeless::from(metric()), usize::MAX);
 
         match (expected, found) {
             (Some((expected_score, _)), Ok((score, _))) => {

@@ -1,13 +1,49 @@
-#![allow(unused)]
 mod common;
 use bdk_coin_select::{
-    float::Ordf32,
-    metrics::{Changeless, LowestFee},
-    BnbMetric, Candidate, CoinSelector, DrainWeights, FeeRate, SelectionProblem, Target, TargetFee,
-    TargetOutputs,
+    float::Ordf32, metrics::LowestFeeChangeless, BnbMetric, Candidate, DrainWeights, FeeRate,
+    SelectionProblem, Target, TargetFee, TargetOutputs,
 };
+#[cfg(not(debug_assertions))]
 use proptest::{prelude::*, proptest, test_runner::*};
-use rand::{prelude::IteratorRandom, Rng, RngCore};
+#[cfg(not(debug_assertions))]
+use rand::{Rng, RngCore};
+
+#[test]
+fn funded_changeful_branch_is_bounded_by_its_no_change_fee() {
+    let target = Target {
+        outputs: TargetOutputs {
+            n_outputs: 1,
+            value_sum: 100_000,
+            weight_sum: 100,
+        },
+        fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(1.0)),
+        max_weight: None,
+    };
+    let problem = SelectionProblem::new_no_ancestors(
+        target,
+        [Candidate {
+            value: 110_000,
+            weight: 200,
+            segwit_count: 1,
+            legacy_count: 0,
+        }],
+    );
+    let mut selector = problem.selector();
+    selector.select(0);
+    let mut metric = LowestFeeChangeless {
+        long_term_feerate: FeeRate::ZERO,
+        dust_relay_feerate: FeeRate::ZERO,
+        drain_weights: DrainWeights {
+            output_weight: 100,
+            spend_weight: 100,
+            n_outputs: 1,
+        },
+    };
+    let view = selector.compute_view();
+
+    assert!(metric.score(&view).is_none(), "this selection wants change");
+    assert_eq!(metric.bound(&view), Some(Ordf32(10_000.0)));
+}
 
 #[test]
 fn mixed_serialization_overhead_does_not_prune_exact_solution() {
@@ -36,11 +72,11 @@ fn mixed_serialization_overhead_does_not_prune_exact_solution() {
     ];
     let problem = SelectionProblem::new_no_ancestors(target, candidates);
     let mut selector = problem.selector();
-    let metric = Changeless(LowestFee {
+    let metric = LowestFeeChangeless {
         long_term_feerate: FeeRate::ZERO,
         dust_relay_feerate: FeeRate::ZERO,
         drain_weights: DrainWeights::NONE,
-    });
+    };
 
     let mut expected = problem.selector();
     expected.select_all();
@@ -55,6 +91,7 @@ fn mixed_serialization_overhead_does_not_prune_exact_solution() {
     assert_eq!(selector.excess(bdk_coin_select::Drain::NONE), 0);
 }
 
+#[cfg(not(debug_assertions))]
 fn test_wv(mut rng: impl RngCore) -> impl Iterator<Item = Candidate> {
     core::iter::repeat_with(move || {
         let value = rng.random_range(0..1_000);
@@ -67,11 +104,11 @@ fn test_wv(mut rng: impl RngCore) -> impl Iterator<Item = Candidate> {
     })
 }
 
+#[cfg(not(debug_assertions))]
 proptest! {
     #![proptest_config(ProptestConfig::default())]
 
     #[test]
-    #[cfg(not(debug_assertions))] // too slow if compiling for debug
     fn compare_against_benchmarks(
         n_candidates in 0..15_usize,        // candidates (n)
         target_value in 500..1_000_000_u64,   // target value (sats)
@@ -79,14 +116,11 @@ proptest! {
         target_weight in 0..10_000_u32,         // the sum of the weight of the outputs (wu)
         replace in common::maybe_replace(0..10_000u64), // The weight of the transaction we're replacing
         feerate in 1.0..100.0_f32,          // feerate (sats/vb)
-        feerate_lt_diff in -5.0..50.0_f32,  // longterm feerate diff (sats/vb)
         drain_weight in 100..=500_u32,      // drain weight (wu)
         drain_spend_weight in 1..=2000_u32, // drain spend weight (wu)
-        drain_dust in 100..=1000_u64,       // drain dust (sats)
         n_drain_outputs in 1..150usize,     // the number of drain outputs
     ) {
         println!("=======================================");
-        let start = std::time::Instant::now();
         let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
         let feerate = FeeRate::from_sat_per_vb(feerate);
         let drain_weights = DrainWeights {
@@ -113,38 +147,32 @@ proptest! {
             max_weight: None,
         };
         let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
-        let cs = CoinSelector::new(&problem);
-
         let make_metric = || {
-            Changeless(LowestFee {
+            LowestFeeChangeless {
                 long_term_feerate: feerate,
                 dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
                 drain_weights,
-            })
+            }
         };
 
-        let solutions = cs.bnb_solutions(make_metric());
+        let mut exhaustive_cs = problem.selector();
+        let mut exhaustive_metric = make_metric();
+        let expected = common::exhaustive_search(&mut exhaustive_cs, &mut exhaustive_metric);
 
-        println!("candidates: {:#?}", cs.candidates().collect::<Vec<_>>());
+        let mut bnb_cs = problem.selector();
+        let found = common::bnb_search(&mut bnb_cs, make_metric(), usize::MAX);
 
-        let best = solutions
-            .enumerate()
-            .filter_map(|(i, sol)| Some((i, sol?)))
-            .last();
-
-
-        match best {
-            Some((_i, (_sol, _score))) => {
-                /* there is nothing to check about a changeless solution */
+        match (expected, found) {
+            (Some((expected_score, _)), Ok((score, _))) => {
+                prop_assert_eq!(score, expected_score, "bnb={} exhaustive={}", bnb_cs, exhaustive_cs);
             }
-            None => {
-                let mut cs = cs.clone();
-                let mut metric = make_metric();
-                let has_solution = common::exhaustive_search(&mut cs, &mut metric).is_some();
-                dbg!(format!("{}", cs));
-                assert!(!has_solution);
-            }
+            (None, Err(_)) => {}
+            (expected, found) => prop_assert!(
+                false,
+                "disagreement: exhaustive={:?} bnb={:?}",
+                expected.map(|(score, _)| score),
+                found.map(|(score, _)| score),
+            ),
         }
-        dbg!(start.elapsed());
     }
 }

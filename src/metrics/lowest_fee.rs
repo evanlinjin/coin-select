@@ -43,7 +43,7 @@ pub struct LowestFee {
 
 impl LowestFee {
     /// The value the change output should have, or `None` if this selection should be changeless.
-    fn drain_value(&self, cs: &SelectionView<'_>) -> Option<u64> {
+    pub(super) fn drain_value(&self, cs: &SelectionView<'_>) -> Option<u64> {
         // The change output pays for its own weight, so the value we'd actually recover is the
         // excess remaining after accounting for that weight.
         let excess_with_drain_weight = cs.excess(Drain {
