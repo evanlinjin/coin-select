@@ -299,6 +299,24 @@ impl SelectionProblem {
         self.has_shared_ancestors
     }
 
+    pub(crate) fn ancestor_fee_precision_slack(&self) -> u64 {
+        let rate = self.target.fee.rate.spwu() as f64;
+        if rate == 0.0 {
+            return 0;
+        }
+        let total_weight = self
+            .ancestors
+            .iter()
+            .fold(0_u64, |sum, (weight, _)| sum.saturating_add(*weight));
+        let max_fee = total_weight as f64 * rate;
+        if max_fee <= (1_u64 << f32::MANTISSA_DIGITS) as f64 {
+            return 0;
+        }
+        // Conversion and multiplication each round in `implied_fee_wu`. Two f32 epsilons plus one
+        // satoshi conservatively cover their combined error for every ancestor subset.
+        ((max_fee * 2.0 * f32::EPSILON as f64).min(u64::MAX as f64) as u64).saturating_add(1)
+    }
+
     /// The fee still owed so the ancestors only this candidate would drag in meet
     /// [`Target::fee`](crate::TargetFee)'s rate, as if it were the only selected candidate.
     ///
