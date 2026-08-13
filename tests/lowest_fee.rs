@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 mod common;
-use bdk_coin_select::metrics::{Changeless, LowestFee};
+use bdk_coin_select::metrics::{LowestFee, LowestFeeChangeless};
 use bdk_coin_select::{
     BnbMetric, Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, FeeRate, NoBnbSolution,
     Replace, SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
@@ -174,9 +174,8 @@ proptest! {
     }
 }
 
-/// We wrap `LowestFee` in `Changeless` to derive a metric that finds the lowest-fee changeless
-/// solution. Constraining to changeless should never take fewer rounds than the unconstrained
-/// `LowestFee`.
+/// The dedicated changeless metric shares `LowestFee`'s eligibility rules while bounding its
+/// narrower objective directly.
 #[test]
 fn combined_changeless_metric() {
     let params = common::StrategyParams {
@@ -202,7 +201,7 @@ fn combined_changeless_metric() {
     let mut cs_b = CoinSelector::new(&problem_5);
     let metric_lowest_fee = params.lowest_fee_metric();
 
-    let metric_changeless = Changeless(params.lowest_fee_metric());
+    let metric_changeless = LowestFeeChangeless::from(params.lowest_fee_metric());
 
     // cs_a uses the unconstrained metric
     let (score, rounds) =
@@ -214,7 +213,9 @@ fn combined_changeless_metric() {
         common::bnb_search(&mut cs_b, metric_changeless, usize::MAX).expect("must find solution");
     println!("score={:?} rounds={}", combined_score, combined_rounds);
 
-    assert!(combined_rounds >= rounds);
+    assert!(combined_score >= score);
+    let mut change_decision = params.lowest_fee_metric();
+    assert!(change_decision.drain(&cs_b.compute_view()).is_none());
 }
 
 /// Because this metric decides change optimally, it never creates a change output whose value
