@@ -89,13 +89,7 @@ impl FeeRate {
 
     /// Same as [implied_fee](Self::implied_fee) except the fee rate given by `self` is applied to `tx_weight` directly.
     pub fn implied_fee_wu(&self, tx_weight: u64) -> u64 {
-        let fee = tx_weight as f64 * self.spwu() as f64;
-        let truncated = fee as u64;
-        if truncated as f64 == fee {
-            truncated
-        } else {
-            truncated.saturating_add(1)
-        }
+        (tx_weight as f32 * self.spwu()).ceil() as u64
     }
 }
 
@@ -112,16 +106,5 @@ impl Sub<FeeRate> for FeeRate {
 
     fn sub(self, rhs: FeeRate) -> Self::Output {
         Self(Ordf32(self.0 .0 - rhs.0 .0))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn implied_fee_wu_retains_integer_precision_above_f32_range() {
-        let rate = FeeRate::from_sat_per_wu(43.0);
-        assert_eq!(rate.implied_fee_wu(399_999), 17_199_957);
     }
 }

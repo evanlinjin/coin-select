@@ -25,8 +25,8 @@ pub(crate) struct SelectionCache {
     private_reachable_surplus: f64,
     shared_reachable_refcounts: Vec<u32>,
     shared_reachable_surplus: f64,
+    ancestor_fee_precision_slack: u64,
     selected: Bitset,
-    available: Bitset,
 }
 
 impl SelectionCache {
@@ -38,30 +38,43 @@ impl SelectionCache {
             legacy_count: 0,
             private_weight: 0,
             private_fee: 0,
-            shared_refcounts: alloc::vec![0; selector.problem().ancestors().len()],
+            shared_refcounts: alloc::vec![
+                0;
+                if selector.problem().has_shared_ancestors() {
+                    selector.problem().ancestors().len()
+                } else {
+                    0
+                }
+            ],
             shared_weight: 0,
             shared_fee: 0,
             private_reachable_surplus: 0.0,
-            shared_reachable_refcounts: alloc::vec![0; selector.problem().ancestors().len()],
+            shared_reachable_refcounts: alloc::vec![
+                0;
+                if selector.problem().has_shared_ancestors() {
+                    selector.problem().ancestors().len()
+                } else {
+                    0
+                }
+            ],
             shared_reachable_surplus: 0.0,
-            selected: Bitset::with_capacity(if selector.problem().has_ancestors() {
-                selector.problem().len()
-            } else {
-                0
-            }),
-            available: Bitset::with_capacity(if selector.problem().has_ancestors() {
-                selector.problem().len()
-            } else {
-                0
-            }),
+            ancestor_fee_precision_slack: selector.problem().ancestor_fee_precision_slack(),
+            // BnB transitions each candidate exactly once, so it needs no duplicate-tracking
+            // bitset. Public hypothetical updates allocate this lazily in `track_selected`.
+            selected: Bitset::default(),
         };
-        for (index, candidate) in selector.selected() {
-            cache.add(selector.problem(), index, candidate);
-        }
         if selector.problem().has_ancestors() {
             for (index, _) in selector.candidates() {
-                if !selector.is_selected(index) && !selector.banned().contains(index) {
-                    cache.add_reachable(selector.problem(), index);
+                cache.add_reachable(selector.problem(), index);
+            }
+        }
+        for (index, candidate) in selector.selected() {
+            cache.add(selector.problem(), index, candidate, true);
+        }
+        if selector.problem().has_ancestors() {
+            for index in selector.banned().iter() {
+                if !selector.is_selected(index) {
+                    cache.ban(selector.problem(), index);
                 }
             }
         }
@@ -74,9 +87,6 @@ impl SelectionCache {
 
     fn add_reachable(&mut self, problem: &SelectionProblem, index: usize) {
         if !problem.has_ancestors() {
-            return;
-        }
-        if !self.available.insert(index) {
             return;
         }
         if problem.has_private_ancestors() {
@@ -98,9 +108,6 @@ impl SelectionCache {
 
     fn remove_reachable(&mut self, problem: &SelectionProblem, index: usize) {
         if !problem.has_ancestors() {
-            return;
-        }
-        if !self.available.remove(index) {
             return;
         }
         if problem.has_private_ancestors() {
@@ -129,7 +136,13 @@ impl SelectionCache {
         input_varint_weight + self.weight_sum + legacy_witness_lengths + witness_header_extra_weight
     }
 
-    pub(crate) fn add(&mut self, problem: &SelectionProblem, index: usize, candidate: Candidate) {
+    pub(crate) fn add(
+        &mut self,
+        problem: &SelectionProblem,
+        index: usize,
+        candidate: Candidate,
+        was_reachable: bool,
+    ) {
         if self.selected.capacity() > 0 && !self.selected.insert(index) {
             return;
         }
@@ -137,7 +150,9 @@ impl SelectionCache {
         self.weight_sum += candidate.weight;
         self.segwit_count += candidate.segwit_count;
         self.legacy_count += candidate.legacy_count;
-        self.remove_reachable(problem, index);
+        if was_reachable {
+            self.remove_reachable(problem, index);
+        }
 
         if problem.has_private_ancestors() {
             let (weight, fee) = problem.private_ancestors(index);
@@ -259,9 +274,12 @@ impl<'a> SelectionView<'a> {
     pub fn add(&mut self, index: usize) {
         self.track_selected();
         let candidate = self.selector.candidate(index);
-        self.cache
-            .to_mut()
-            .add(self.selector.problem(), index, candidate);
+        self.cache.to_mut().add(
+            self.selector.problem(),
+            index,
+            candidate,
+            !self.selector.banned().contains(index),
+        );
     }
 
     /// Apply a hypothetical deselection to this view's cached aggregates.
@@ -282,7 +300,7 @@ impl<'a> SelectionView<'a> {
         let candidate = self.selector.candidate(index);
         self.cache
             .to_mut()
-            .add(self.selector.problem(), index, candidate);
+            .add(self.selector.problem(), index, candidate, true);
     }
 
     pub(crate) fn sub_unchecked(&mut self, index: usize) {
@@ -340,7 +358,7 @@ impl<'a> SelectionView<'a> {
         if bound <= 0.0 {
             0
         } else {
-            bound as u64
+            (bound as u64).saturating_sub(self.cache.ancestor_fee_precision_slack)
         }
     }
 
@@ -496,11 +514,20 @@ impl<'a> SelectionView<'a> {
     /// A lower bound on the child fee for this branch and every descendant.
     pub(crate) fn fee_floor(&self) -> u64 {
         let weight = self.weight(self.target().outputs, DrainWeights::NONE);
-        let mut floor = (self.target().fee.rate.implied_fee_wu(weight)
-            + self.ancestor_bump_lower_bound())
-        .max(self.target().fee.absolute);
+        let rate_floor = self
+            .target()
+            .fee
+            .rate
+            .implied_fee_wu(weight)
+            .min(self.target().fee.rate.implied_fee(weight));
+        let mut floor =
+            (rate_floor + self.ancestor_bump_lower_bound()).max(self.target().fee.absolute);
         if let Some(replace) = self.target().fee.replace {
-            floor = floor.max(replace.min_fee_to_do_replacement_wu(weight));
+            floor = floor.max(
+                replace
+                    .min_fee_to_do_replacement_wu(weight)
+                    .min(replace.min_fee_to_do_replacement(weight)),
+            );
         }
         floor
     }
@@ -619,6 +646,40 @@ mod tests {
         assert_eq!(view.ancestor_bump(), once);
         view.sub(1);
         assert_eq!(view.ancestor_bump(), 0);
+    }
+
+    #[test]
+    fn hypothetical_banned_candidate_does_not_change_reachability() {
+        let ancestors = [AncestorToBump {
+            txid: 1,
+            weight: 400,
+            fee: 1_000,
+            parents: alloc::vec![],
+        }];
+        let inputs = [
+            Input {
+                value: 1_000,
+                weight: 100,
+                is_segwit: true,
+                residing_txid: 1,
+            },
+            Input {
+                value: 2_000,
+                weight: 100,
+                is_segwit: true,
+                residing_txid: 1,
+            },
+        ];
+        let problem = SelectionProblem::new(target(), inputs, ancestors);
+        let mut selector = problem.selector();
+        selector.ban(0);
+        selector.ban(1);
+        let mut view = selector.compute_view();
+        let bound = view.ancestor_bump_lower_bound();
+
+        view.add(0);
+        view.sub(0);
+        assert_eq!(view.ancestor_bump_lower_bound(), bound);
     }
 
     #[test]
