@@ -12,7 +12,7 @@ use bdk_coin_select::{
     float::Ordf32,
     metrics::{Changeless, LowestFee},
     AncestorToBump, BnbMetric, Candidate, CoinSelector, Drain, DrainWeights, FeeRate, Input,
-    SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
+    Replace, SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
 };
 use proptest::prelude::*;
 
@@ -565,6 +565,190 @@ fn ancestors_are_split_into_private_and_shared() {
     );
     assert!(!unshared.has_shared_ancestors());
     assert!(unshared.has_ancestors());
+}
+
+/// A funded node's bound must give up the surplus a descendant could still pick up — otherwise it
+/// sits above that descendant's score.
+#[test]
+fn funded_bound_gives_up_reachable_surplus() {
+    let t = target(1.0, 10_000); // 0.25 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [input(50_000, "POOR"), input(50_000, "RICH")],
+        [
+            ancestor("POOR", 4_000, 0, vec![]),    // owes 1_000
+            ancestor("RICH", 400, 10_000, vec![]), // overpays by 9_900
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    assert!(cs.is_funded());
+    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.ancestor_bump_lower_bound(), 0);
+
+    let score = metric().score(&cs).unwrap();
+    let bound = metric().bound(&cs).unwrap();
+    assert!(
+        bound <= Ordf32(score.0 - 1_000.0),
+        "bound {} must sit at least the 1_000 surplus below score {}",
+        bound,
+        score
+    );
+
+    let mut both = cs.clone();
+    both.select(1);
+    let both_score = metric().score(&both).unwrap();
+    assert!(
+        bound <= both_score,
+        "bound {} above descendant score {}",
+        bound,
+        both_score
+    );
+}
+
+/// Subtracting two large `f32`s can round the bound upward. Surplus is therefore subtracted in
+/// integer space before the result is converted to the metric's `f32` score.
+#[test]
+fn funded_bound_subtracts_surplus_before_float_conversion() {
+    let t = Target {
+        fee: TargetFee {
+            rate: FeeRate::from_sat_per_vb(20_000.0), // 5_000 sat/wu
+            absolute: 0,
+            replace: None,
+        },
+        outputs: TargetOutputs {
+            value_sum: 0,
+            weight_sum: 100,
+            n_outputs: 1,
+        },
+        max_weight: None,
+    };
+    let problem = SelectionProblem::new(
+        t,
+        [
+            Input {
+                value: 1_998_700_000,
+                weight: 0,
+                is_segwit: false,
+                residing_txid: "POOR",
+            },
+            Input {
+                value: 0,
+                weight: 0,
+                is_segwit: false,
+                residing_txid: "RICH",
+            },
+        ],
+        [
+            ancestor("POOR", 400_000, 2_000_000, vec![]), // owes 1_998_000_000
+            ancestor("RICH", 0, 1_998_000_000, vec![]),   // cancels POOR exactly
+        ],
+    );
+    let mut metric = LowestFee {
+        long_term_feerate: FeeRate::from_sat_per_vb(1.0),
+        dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
+        drain_weights: DrainWeights::NONE,
+    };
+
+    let mut node = problem.selector();
+    node.select(0);
+    assert_eq!(node.ancestor_bump(), 1_998_000_000);
+    assert_eq!(node.ancestor_bump_lower_bound(), 0);
+    let bound = metric.bound(&node).unwrap();
+
+    let mut descendant = node.clone();
+    descendant.select(1);
+    let score = metric.score(&descendant).unwrap();
+    assert_eq!(score, Ordf32(700_000.0));
+    assert!(bound <= score, "bound {} above descendant {}", bound, score);
+}
+
+/// Selecting everything can un-fund, but that must not make the bound claim the subtree is empty.
+#[test]
+fn unfunded_bound_does_not_claim_infeasibility() {
+    let t = target(10.0, 90_000);
+    let problem = SelectionProblem::new(
+        t,
+        [input(100_000, CONFIRMED), input(100_000, "P")],
+        [ancestor("P", 100_000, 0, vec![])],
+    );
+
+    let cs = problem.selector();
+    assert!(!cs.is_funded());
+    assert!(
+        metric().bound(&cs).is_some(),
+        "an unfunded root with a live funded subset must not be pruned"
+    );
+}
+
+/// Existing package surplus can pay a later candidate's private deficit. Pricing that deficit as
+/// the candidate's marginal cost would put the bound above the descendant's score.
+#[test]
+fn unfunded_bound_credits_selected_package_surplus() {
+    let t = target(1.0, 100_000); // 0.25 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [input(60_000, "RICH"), input(50_000, "POOR")],
+        [
+            ancestor("RICH", 400, 10_000, vec![]), // surplus 9_900
+            ancestor("POOR", 4_000, 0, vec![]),    // deficit 1_000
+        ],
+    );
+
+    let mut node = problem.selector();
+    node.select(0);
+    assert!(!node.is_funded());
+
+    let bound = metric().bound(&node).unwrap();
+    let mut descendant = node.clone();
+    descendant.select(1);
+    let score = metric().score(&descendant).unwrap();
+    assert!(
+        bound <= score,
+        "bound {} above package-subsidized descendant {}",
+        bound,
+        score
+    );
+}
+
+/// The absolute fee is already the final child fee floor; the resize must not add target-rate
+/// marginal cost on top of it.
+#[test]
+fn unfunded_bound_does_not_double_count_absolute_fee() {
+    let mut t = target(1.0, 100_000);
+    t.fee.absolute = 5_000;
+    let problem =
+        SelectionProblem::new(t, [input(105_000, "P")], [ancestor("P", 4_000, 0, vec![])]);
+
+    let root = problem.selector();
+    let bound = metric().bound(&root).unwrap();
+    let mut descendant = root.clone();
+    descendant.select(0);
+    let score = metric().score(&descendant).unwrap();
+    assert_eq!(score, Ordf32(5_000.0));
+    assert!(bound <= score, "bound {} above descendant {}", bound, score);
+}
+
+/// RBF rule 4 prices only child weight. Ancestor weight must not enter its effective value, and the
+/// replacement floor must not be charged twice.
+#[test]
+fn unfunded_bound_does_not_double_count_rbf_fee() {
+    let mut t = target(1.0, 100_000);
+    t.fee.replace = Some(Replace {
+        fee: 5_000,
+        incremental_relay_feerate: FeeRate::from_sat_per_vb(1.0),
+    });
+    let problem =
+        SelectionProblem::new(t, [input(105_104, "P")], [ancestor("P", 4_000, 0, vec![])]);
+
+    let root = problem.selector();
+    let bound = metric().bound(&root).unwrap();
+    let mut descendant = root.clone();
+    descendant.select(0);
+    let score = metric().score(&descendant).unwrap();
+    assert_eq!(score, Ordf32(5_104.0));
+    assert!(bound <= score, "bound {} above descendant {}", bound, score);
 }
 
 /// Surplus cannot be cherry-picked: an ancestor arrives only by selecting a candidate, which drags
