@@ -3,11 +3,57 @@ mod common;
 use bdk_coin_select::{
     float::Ordf32,
     metrics::{Changeless, LowestFee},
-    Candidate, CoinSelector, DrainWeights, FeeRate, SelectionProblem, Target, TargetFee,
+    BnbMetric, Candidate, CoinSelector, DrainWeights, FeeRate, SelectionProblem, Target, TargetFee,
     TargetOutputs,
 };
 use proptest::{prelude::*, proptest, test_runner::*};
 use rand::{prelude::IteratorRandom, Rng, RngCore};
+
+#[test]
+fn mixed_serialization_overhead_does_not_prune_exact_solution() {
+    let target = Target {
+        outputs: TargetOutputs {
+            n_outputs: 0,
+            value_sum: 1_000,
+            weight_sum: 0,
+        },
+        fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(4.0)),
+        max_weight: None,
+    };
+    let candidates = [
+        Candidate {
+            value: 1_201,
+            weight: 158,
+            segwit_count: 1,
+            legacy_count: 0,
+        },
+        Candidate {
+            value: 167,
+            weight: 164,
+            segwit_count: 0,
+            legacy_count: 3,
+        },
+    ];
+    let problem = SelectionProblem::new_no_ancestors(target, candidates);
+    let mut selector = problem.selector();
+    let metric = Changeless(LowestFee {
+        long_term_feerate: FeeRate::ZERO,
+        dust_relay_feerate: FeeRate::ZERO,
+        drain_weights: DrainWeights::NONE,
+    });
+
+    let mut expected = problem.selector();
+    expected.select_all();
+    assert_eq!(expected.excess(bdk_coin_select::Drain::NONE), 0);
+    assert!(metric.clone().score(&expected.compute_view()).is_some());
+
+    selector.run_bnb(metric, 100).expect("exact solution");
+    assert_eq!(
+        selector.selected_indices().iter().collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(selector.excess(bdk_coin_select::Drain::NONE), 0);
+}
 
 fn test_wv(mut rng: impl RngCore) -> impl Iterator<Item = Candidate> {
     core::iter::repeat_with(move || {

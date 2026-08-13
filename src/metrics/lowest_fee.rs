@@ -19,7 +19,8 @@ use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionVie
 /// # Unconfirmed ancestors
 ///
 /// When the [`SelectionProblem`] has unconfirmed ancestors, the fee a selection must pay includes
-/// the [`CoinSelector::ancestor_bump`] of the ancestors it drags in, so the search naturally prefers
+/// the [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump) of the ancestors it drags
+/// in, so the search naturally prefers
 /// coins that drag in nothing (or that share an already-paid-for ancestor). The score itself is
 /// still the child transaction's fee — the bump is inside it, not added on top.
 ///
@@ -307,7 +308,7 @@ impl BnbMetric for LowestFee {
             let mut unselected = cs.unselected();
             let (resize_index, to_resize) = loop {
                 let (index, candidate) = unselected.next()?;
-                local.add(index);
+                local.add_unchecked(index);
                 if local.is_funded() {
                     break (index, candidate);
                 }
@@ -317,7 +318,7 @@ impl BnbMetric for LowestFee {
             if local.excess(Drain::NONE) == 0 {
                 return Some(self.fee_score(&local).unwrap().0);
             };
-            local.sub(resize_index);
+            local.sub_unchecked(resize_index);
             let cs = &local;
 
             // We need to find the minimum fee we'd pay if we satisfy the feerate constraint. We do
@@ -410,6 +411,10 @@ impl BnbMetric for LowestFee {
     }
 
     fn requires_ordering_by_descending_value_pwu(&self) -> bool {
+        true
+    }
+
+    fn deduplicate_equivalent_candidates(&self) -> bool {
         true
     }
 }

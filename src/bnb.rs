@@ -172,6 +172,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         // drags in an ancestor that needs bumping). Candidates are only compared until the first
         // mismatch, since this exploits them being adjacent in the sorted order.
         let mut exclusion_cs = cs.clone();
+        let mut exclusion_cache = cache.clone();
         let to_ban = (
             next.value,
             next.weight,
@@ -180,26 +181,30 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         );
         let to_ban_drags_in = cs.problem().drags_in(next_index);
         exclusion_cs.ban(next_index);
+        exclusion_cache.ban(cs.problem(), next_index);
         let mut exclusion_cursor = cursor + 1;
-        for (next_index, next) in iter {
-            if cs.is_selected(next_index) || cs.banned().contains(next_index) {
+        if self.metric.deduplicate_equivalent_candidates() {
+            for (next_index, next) in iter {
+                if cs.is_selected(next_index) || cs.banned().contains(next_index) {
+                    exclusion_cursor += 1;
+                    continue;
+                }
+                if (
+                    next.value,
+                    next.weight,
+                    next.segwit_count,
+                    next.legacy_count,
+                ) != to_ban
+                    || cs.problem().drags_in(next_index) != to_ban_drags_in
+                {
+                    break;
+                }
+                exclusion_cs.ban(next_index);
+                exclusion_cache.ban(cs.problem(), next_index);
                 exclusion_cursor += 1;
-                continue;
             }
-            if (
-                next.value,
-                next.weight,
-                next.segwit_count,
-                next.legacy_count,
-            ) != to_ban
-                || cs.problem().drags_in(next_index) != to_ban_drags_in
-            {
-                break;
-            }
-            exclusion_cs.ban(next_index);
-            exclusion_cursor += 1;
         }
-        self.consider_adding_to_queue(&exclusion_cs, cache, true, exclusion_cursor);
+        self.consider_adding_to_queue(&exclusion_cs, &exclusion_cache, true, exclusion_cursor);
     }
 }
 
@@ -266,6 +271,15 @@ pub trait BnbMetric {
 
     /// Returns whether the metric requies we order candidates by descending value per weight unit.
     fn requires_ordering_by_descending_value_pwu(&self) -> bool {
+        false
+    }
+
+    /// Whether candidates with identical value, weight, input counts, and ancestor sets are
+    /// interchangeable for this metric and may be excluded as one equivalence class.
+    ///
+    /// Leave this as `false` if scoring or bounds inspect candidate indices or other identity not
+    /// represented by [`Candidate`](crate::Candidate).
+    fn deduplicate_equivalent_candidates(&self) -> bool {
         false
     }
 }

@@ -133,26 +133,22 @@ impl<'a> CoinSelector<'a> {
     /// Whether the candidates can cover this `target`'s **value** (net of input fees) — i.e. whether
     /// enough value is reachable for [`is_funded`] to hold. Respects [`ban`]ned candidates.
     ///
-    /// Selecting *all* effective inputs maximizes the value available, so if that can't meet the
-    /// target value, nothing can.
+    /// This selects all remaining candidates with positive standalone effective value. The current
+    /// selection is checked first because transaction framing can make adding such a candidate
+    /// reduce the selection's actual excess.
     ///
     /// NOTE: this does **not** account for [`Target::max_weight`] — a `true` result can still be
     /// infeasible under the weight cap. Use [`select_until_target_met`] or branch and bound (both of
     /// which enforce the cap) to actually build a selection.
     ///
-    /// NOTE: this is exact only when [`SelectionProblem::has_ancestors`] is `false`. With
-    /// unconfirmed ancestors, funding is not monotone (an input can drag in an ancestor that costs
-    /// more than the input is worth, and inputs sharing an ancestor pay for it once between them),
-    /// so the all-effective selection is no longer guaranteed to be the best case: this becomes a
-    /// heuristic and can answer either way. Use branch and bound to decide feasibility exactly.
+    /// This is a heuristic because input-count varints, witness framing, and ancestors make
+    /// candidates' marginal effective values selection-dependent.
     ///
     /// [`ban`]: Self::ban
     /// [`is_funded`]: Self::is_funded
     /// [`select_until_target_met`]: Self::select_until_target_met
     pub fn is_fundable(&self) -> bool {
-        let mut test = self.clone();
-        test.select_all_effective(self.target().fee.rate);
-        test.is_funded()
+        self.compute_view().is_fundable()
     }
 
     /// Returns true if no candidates have been selected.
