@@ -6,8 +6,10 @@
 //!
 //! - `clone`: direct cost of `CoinSelector::clone()`, the operation `Bitset`
 //!   was introduced to make cheap.
-//! - `run_bnb_lowest_fee`: end-to-end Branch-and-Bound throughput on a
-//!   deterministic synthetic pool using the `LowestFee` metric.
+//! - `run_bnb_lowest_fee`: end-to-end Branch-and-Bound solution finding on a deterministic
+//!   synthetic pool using the `LowestFee` metric.
+//! - `run_bnb_lowest_fee_exhaust_cap`: frontier expansion at sizes that exhaust the fixed round
+//!   cap, isolating the cache and cursor hot path.
 //! - `run_bnb_lowest_fee_ancestors`: the same, but where the coins sit on unconfirmed ancestors that
 //!   need bumping — covering both the private and shared ancestor paths, which cost different
 //!   amounts per fee calculation.
@@ -118,25 +120,38 @@ fn bench_compute_view(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_run_bnb_lowest_fee(c: &mut Criterion) {
-    let mut group = c.benchmark_group("run_bnb_lowest_fee");
-    // Cap iterations so the largest case fits in a benchmark sample.
-    group.sample_size(20);
-    for &n in &[20usize, 50, 100, 200] {
+const MAX_ROUNDS: usize = 100_000;
+
+fn bench_run_bnb_lowest_fee_sizes(
+    c: &mut Criterion,
+    group_name: &str,
+    sizes: &[usize],
+    expect_solution: bool,
+) {
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    for &n in sizes {
         let candidates = make_candidates(n);
         let (target, long_term_feerate) = make_bnb_inputs(&candidates);
-        let problem_2 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
-        let selector = CoinSelector::new(&problem_2);
+        let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let selector = CoinSelector::new(&problem);
+        let metric = || LowestFee {
+            long_term_feerate,
+            dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
+            drain_weights: DrainWeights::TR_KEYSPEND,
+        };
+        assert_eq!(
+            selector.clone().run_bnb(metric(), MAX_ROUNDS).is_ok(),
+            expect_solution,
+            "{}/{} changed search path",
+            group_name,
+            n,
+        );
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_batched(
                 || selector.clone(),
                 |mut sel| {
-                    let metric = LowestFee {
-                        long_term_feerate,
-                        dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
-                        drain_weights: DrainWeights::TR_KEYSPEND,
-                    };
-                    let _ = sel.run_bnb(metric, black_box(100_000));
+                    let _ = sel.run_bnb(metric(), black_box(MAX_ROUNDS));
                     sel
                 },
                 BatchSize::SmallInput,
@@ -144,6 +159,19 @@ fn bench_run_bnb_lowest_fee(c: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+fn bench_run_bnb_lowest_fee(c: &mut Criterion) {
+    bench_run_bnb_lowest_fee_sizes(c, "run_bnb_lowest_fee", &[20, 50, 100], true);
+}
+
+fn bench_run_bnb_lowest_fee_exhaust_cap(c: &mut Criterion) {
+    bench_run_bnb_lowest_fee_sizes(
+        c,
+        "run_bnb_lowest_fee_exhaust_cap",
+        &[200, 500, 1_000],
+        false,
+    );
 }
 
 /// Deterministic synthetic pool where every third coin sits on an unconfirmed chain that still owes
@@ -245,6 +273,7 @@ criterion_group!(
     bench_coin_selector_clone,
     bench_compute_view,
     bench_run_bnb_lowest_fee,
+    bench_run_bnb_lowest_fee_exhaust_cap,
     bench_run_bnb_lowest_fee_ancestors
 );
 criterion_main!(benches);
