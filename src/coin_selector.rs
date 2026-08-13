@@ -275,20 +275,24 @@ impl<'a> CoinSelector<'a> {
         union
     }
 
-    /// A lower bound on the [`ancestor_bump`](Self::ancestor_bump) of this selection **and of every
-    /// selection extending it**.
+    /// The least [`ancestor_bump`](Self::ancestor_bump) this selection — or any selection extending
+    /// it — could still owe.
     ///
-    /// A descendant adds some of the [`addable_ancestors`](Self::addable_ancestors), which moves what
-    /// it owes by `Σ rate·weight(a) − fee(a)` over them. So the cheapest reachable case is the one
-    /// that picks up as much *surplus* (ancestors paying above the rate) as it can:
+    /// This is **not** the bump of the current selection. A later coin can drag in an ancestor that
+    /// already overpays the target rate; that surplus nets against the deficit, so a descendant can
+    /// owe *less*. This method credits every still-reachable surplus and floors at zero:
     ///
     /// ```text
-    /// bump(S ∪ D) >= max(0, rate·weight(S) − fee(S) − shed)
+    /// bump of this selection, and of every selection that adds more coins
+    ///     >=  max(0, currently_owed − reachable_surplus)
     /// ```
     ///
-    /// Surplus cannot be picked up ancestor by ancestor though, because ancestors arrive by selecting
-    /// a *candidate*, which drags in its whole transitive set. So `shed` accumulates per group that
-    /// must arrive together, which is exactly the split [`SelectionProblem`] already computed:
+    /// where `currently_owed` is `rate · ancestor_weight − ancestor_fee` of this selection, and
+    /// `reachable_surplus` is how much still-addable ancestors overpay the target rate.
+    ///
+    /// Surplus cannot be picked up ancestor by ancestor: ancestors arrive by selecting a
+    /// *candidate*, which drags in its whole transitive set. So `reachable_surplus` is accumulated
+    /// per group that must arrive together — the split [`SelectionProblem`] already computed:
     ///
     /// - Ancestors only one candidate can reach ([`private_ancestors`]) are netted as a group, and
     ///   contribute only if the group as a whole is in surplus. A chain whose tip overpays but which
@@ -297,8 +301,8 @@ impl<'a> CoinSelector<'a> {
     ///   since which candidate brings them — and what else it brings — is not pinned down.
     ///
     /// This is still a relaxation: those groups may not be reachable *together*, and reaching them at
-    /// all means adding candidates, which adds child weight and value. Both only push the real figure
-    /// up. When nothing reachable is in surplus it is exactly the current bump.
+    /// all means adding candidates (and their child weight). Both only push the real figure up. When
+    /// nothing reachable overpays, the bound equals the current bump.
     ///
     /// Computed in floating point and floored, so it can sit a fraction of a satoshi below the exact
     /// value — in the safe direction.
