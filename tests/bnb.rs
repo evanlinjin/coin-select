@@ -1,7 +1,7 @@
 mod common;
 use bdk_coin_select::{
-    float::Ordf32, BnbMetric, Candidate, CoinSelector, Drain, SelectionProblem, Target, TargetFee,
-    TargetOutputs,
+    float::Ordf32, BnbMetric, Candidate, CoinSelector, Drain, SelectionProblem, SelectionView,
+    Target, TargetFee, TargetOutputs,
 };
 #[macro_use]
 extern crate alloc;
@@ -33,7 +33,7 @@ struct MinExcessThenWeight;
 const EXCESS_RATIO: f32 = 1_000_000_f32;
 
 impl BnbMetric for MinExcessThenWeight {
-    fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
+    fn score(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         let excess = cs.excess(Drain::NONE);
         if excess < 0 {
             None
@@ -44,13 +44,13 @@ impl BnbMetric for MinExcessThenWeight {
         }
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
-        let mut cs = cs.clone();
+    fn bound(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
+        let mut cs = cs.selector().clone();
         cs.select_until_target_met().ok()?;
         Some(Ordf32(cs.input_weight() as f32))
     }
 
-    fn drain(&mut self, _cs: &CoinSelector<'_>) -> Drain {
+    fn drain(&mut self, _cs: &SelectionView<'_>) -> Drain {
         Drain::NONE
     }
 }
@@ -140,6 +140,39 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
     assert_eq!(rounds, 164);
     let excess = sol.excess(Drain::NONE);
     assert_eq!(excess, 0);
+}
+
+#[test]
+fn exclusion_cursor_skips_preselected_equivalent_candidate() {
+    let candidates = [
+        Candidate::new_legacy(500, 100),
+        Candidate::new_legacy(500, 100),
+        Candidate::new_legacy(400, 100),
+    ];
+    let target = Target {
+        outputs: TargetOutputs {
+            value_sum: 900,
+            weight_sum: 0,
+            n_outputs: 1,
+        },
+        fee: TargetFee::ZERO,
+        max_weight: None,
+    };
+    let problem = SelectionProblem::new_no_ancestors(target, candidates);
+    let mut selector = problem.selector();
+    selector.select(1);
+
+    selector
+        .run_bnb(MinExcessThenWeight, 1_000)
+        .expect("must find a solution");
+
+    assert_eq!(
+        selector.selected_indices().iter().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    for (index, _) in selector.selected() {
+        assert!(!selector.banned().contains(index));
+    }
 }
 
 proptest! {

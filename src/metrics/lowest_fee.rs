@@ -1,4 +1,4 @@
-use crate::{float::Ordf32, BnbMetric, CoinSelector, Drain, DrainWeights, FeeRate};
+use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionView};
 
 /// Metric that aims to minimize transaction fees. The future fee for spending the change output is
 /// included in this calculation.
@@ -42,7 +42,7 @@ pub struct LowestFee {
 
 impl LowestFee {
     /// The value the change output should have, or `None` if this selection should be changeless.
-    fn drain_value(&self, cs: &CoinSelector<'_>) -> Option<u64> {
+    fn drain_value(&self, cs: &SelectionView<'_>) -> Option<u64> {
         // The change output pays for its own weight, so the value we'd actually recover is the
         // excess remaining after accounting for that weight.
         let excess_with_drain_weight = cs.excess(Drain {
@@ -88,7 +88,7 @@ impl LowestFee {
     /// Any [`CoinSelector::ancestor_bump`] is not added on top: it is already inside the child's fee,
     /// because covering it is what [`CoinSelector::is_funded`] demands and what the change
     /// calculation gives up.
-    fn fee_score(&self, cs: &CoinSelector<'_>) -> Option<(Ordf32, Drain)> {
+    fn fee_score(&self, cs: &SelectionView<'_>) -> Option<(Ordf32, Drain)> {
         if !cs.is_funded() {
             return None;
         }
@@ -111,7 +111,7 @@ impl LowestFee {
 
     /// Whether a descendant of `cs` could still add both a change output and at least one more
     /// input under `max_weight`. Same test as the no-ancestor funded path.
-    fn change_is_reachable(&self, cs: &CoinSelector<'_>) -> bool {
+    fn change_is_reachable(&self, cs: &SelectionView<'_>) -> bool {
         match cs.target().max_weight {
             None => true,
             Some(max_weight) => cs.min_input_weight().map_or(false, |min_input_weight| {
@@ -131,7 +131,7 @@ impl LowestFee {
     /// lower bound on the real added child weight. Candidate ancestry is ignored and the global bump
     /// floor is used instead, avoiding package-surplus double counting. Flooring the fractional
     /// weight keeps floating-point error in the safe direction.
-    fn bound_with_ancestors(&self, cs: &CoinSelector<'_>) -> Ordf32 {
+    fn bound_with_ancestors(&self, cs: &SelectionView<'_>) -> Ordf32 {
         if cs.is_funded() {
             let (_, drain) = self.fee_score(cs).unwrap();
             let current_score = cs.fee(cs.target().value(), drain.value) as u64
@@ -219,14 +219,14 @@ impl LowestFee {
 }
 
 impl BnbMetric for LowestFee {
-    fn drain(&mut self, cs: &CoinSelector<'_>) -> Drain {
+    fn drain(&mut self, cs: &SelectionView<'_>) -> Drain {
         self.drain_value(cs).map_or(Drain::NONE, |value| Drain {
             weights: self.drain_weights,
             value,
         })
     }
 
-    fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
+    fn score(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         let (score, drain) = self.fee_score(cs)?;
         // A final selection must fit the weight cap. `drain_value` already refuses an over-cap
         // change, but a changeless selection can still be too heavy on its own. Reuse the drain
@@ -237,7 +237,7 @@ impl BnbMetric for LowestFee {
         Some(score)
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
+    fn bound(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         // Weight hard-prune: input weight only grows as this branch is extended, so the lightest
         // solution in the subtree is this selection with no drain. If even that busts `max_weight`,
         // the whole subtree is infeasible -> prune. (Also keeps `fee_score(cs).unwrap()` below
@@ -303,14 +303,22 @@ impl BnbMetric for LowestFee {
             Some(current_score)
         } else {
             // Step 1: select everything up until the input that hits the cs.target().
-            let (mut cs, resize_index, to_resize) =
-                cs.clone().select_iter().find(|(cs, _, _)| cs.is_funded())?;
+            let mut local = cs.clone();
+            let mut unselected = cs.unselected();
+            let (resize_index, to_resize) = loop {
+                let (index, candidate) = unselected.next()?;
+                local.add(index);
+                if local.is_funded() {
+                    break (index, candidate);
+                }
+            };
 
             // If this selection is already perfect, return its score directly.
-            if cs.excess(Drain::NONE) == 0 {
-                return Some(self.fee_score(&cs).unwrap().0);
+            if local.excess(Drain::NONE) == 0 {
+                return Some(self.fee_score(&local).unwrap().0);
             };
-            cs.deselect(resize_index);
+            local.sub(resize_index);
+            let cs = &local;
 
             // We need to find the minimum fee we'd pay if we satisfy the feerate constraint. We do
             // this by imagining we had a perfect input that perfectly hit the cs.target(). The sats per

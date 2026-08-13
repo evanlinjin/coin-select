@@ -1,6 +1,6 @@
 use core::cmp::Reverse;
 
-use crate::{float::Ordf32, Drain};
+use crate::{float::Ordf32, Drain, SelectionCache, SelectionView};
 
 use super::CoinSelector;
 use alloc::collections::BinaryHeap;
@@ -49,11 +49,20 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
         //     self.metric.score(&branch.selector),
         // );
 
-        let selector = branch.selector;
+        let Branch {
+            selector,
+            cache,
+            is_exclusion,
+            cursor,
+            ..
+        } = branch;
 
         let mut return_val = None;
-        if !branch.is_exclusion {
-            if let Some(score) = self.metric.score(&selector) {
+        if !is_exclusion {
+            if let Some(score) = self
+                .metric
+                .score(&SelectionView::with_cache(&selector, &cache))
+            {
                 let better = match self.best {
                     Some(best_score) => score < best_score,
                     None => true,
@@ -65,7 +74,7 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
             };
         }
 
-        self.insert_new_branches(&selector);
+        self.insert_new_branches(&selector, &cache, cursor);
         Some(return_val.map(|score| (selector, score)))
     }
 }
@@ -82,13 +91,20 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             selector.sort_candidates_by_descending_value_pwu();
         }
 
-        iter.consider_adding_to_queue(&selector, false);
+        let cache = SelectionCache::from_selector(&selector);
+        iter.consider_adding_to_queue(&selector, &cache, false, 0);
 
         iter
     }
 
-    fn consider_adding_to_queue(&mut self, cs: &CoinSelector<'a>, is_exclusion: bool) {
-        let bound = self.metric.bound(cs);
+    fn consider_adding_to_queue(
+        &mut self,
+        cs: &CoinSelector<'a>,
+        cache: &SelectionCache,
+        is_exclusion: bool,
+        cursor: usize,
+    ) {
+        let bound = self.metric.bound(&SelectionView::with_cache(cs, cache));
         if let Some(bound) = bound {
             let is_good_enough = match self.best {
                 Some(best) => best > bound,
@@ -98,7 +114,9 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
                 let branch = Branch {
                     lower_bound: bound,
                     selector: cs.clone(),
+                    cache: cache.clone(),
                     is_exclusion,
+                    cursor,
                 };
                 /*println!(
                     "\t\t(PUSH) branch={} inclusion={} lb={:?} score={:?}",
@@ -127,43 +145,61 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
           }*/
     }
 
-    fn insert_new_branches(&mut self, cs: &CoinSelector<'a>) {
-        let (next_index, next) = match cs.unselected().next() {
-            Some(c) => c,
-            None => return, // exhausted
+    fn insert_new_branches(&mut self, cs: &CoinSelector<'a>, cache: &SelectionCache, start: usize) {
+        let mut iter = cs.candidates().skip(start);
+        let mut cursor = start;
+        let (next_index, next) = loop {
+            match iter.next() {
+                None => return,
+                Some((index, candidate)) => {
+                    if !cs.is_selected(index) && !cs.banned().contains(index) {
+                        break (index, candidate);
+                    }
+                    cursor += 1;
+                }
+            }
         };
 
         let mut inclusion_cs = cs.clone();
+        let mut inclusion_cache = cache.clone();
         inclusion_cs.select(next_index);
-        self.consider_adding_to_queue(&inclusion_cs, false);
+        inclusion_cache.add(cs.problem(), next_index, next);
+        self.consider_adding_to_queue(&inclusion_cs, &inclusion_cache, false, cursor + 1);
 
         // For the exclusion branch, we keep banning candidates that are interchangeable with the one
         // we just excluded: same value and weight, and dragging in exactly the same unconfirmed
         // ancestors (two coins of equal value and weight are *not* interchangeable if one of them
         // drags in an ancestor that needs bumping). Candidates are only compared until the first
         // mismatch, since this exploits them being adjacent in the sorted order.
-        let mut is_first_ban = true;
         let mut exclusion_cs = cs.clone();
-        let to_ban = (next.value, next.weight);
+        let to_ban = (
+            next.value,
+            next.weight,
+            next.segwit_count,
+            next.legacy_count,
+        );
         let to_ban_drags_in = cs.problem().drags_in(next_index);
-        for (next_index, next) in cs.unselected() {
-            if (next.value, next.weight) != to_ban
+        exclusion_cs.ban(next_index);
+        let mut exclusion_cursor = cursor + 1;
+        for (next_index, next) in iter {
+            if cs.is_selected(next_index) || cs.banned().contains(next_index) {
+                exclusion_cursor += 1;
+                continue;
+            }
+            if (
+                next.value,
+                next.weight,
+                next.segwit_count,
+                next.legacy_count,
+            ) != to_ban
                 || cs.problem().drags_in(next_index) != to_ban_drags_in
             {
                 break;
             }
-            let (_index, _candidate) = exclusion_cs
-                .candidates()
-                .find(|(i, _)| *i == next_index)
-                .expect("must have index since we are planning to ban it");
-            if is_first_ban {
-                is_first_ban = false;
-            } /*else {
-                  println!("banning: [{}] {:?}", _index, _candidate);
-              }*/
             exclusion_cs.ban(next_index);
+            exclusion_cursor += 1;
         }
-        self.consider_adding_to_queue(&exclusion_cs, true);
+        self.consider_adding_to_queue(&exclusion_cs, cache, true, exclusion_cursor);
     }
 }
 
@@ -171,7 +207,9 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
 struct Branch<'a> {
     lower_bound: Ordf32,
     selector: CoinSelector<'a>,
+    cache: SelectionCache,
     is_exclusion: bool,
+    cursor: usize,
 }
 
 impl Ord for Branch<'_> {
@@ -206,25 +244,25 @@ impl Eq for Branch<'_> {}
 ///
 /// This is to be used as input for [`CoinSelector::run_bnb`] or [`CoinSelector::bnb_solutions`].
 pub trait BnbMetric {
-    /// Get the score of a given selection for `target`.
+    /// Get the score of a given selection.
     ///
     /// If this returns `None`, the selection is invalid.
-    fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32>;
+    fn score(&mut self, view: &SelectionView<'_>) -> Option<Ordf32>;
 
-    /// Get the lower bound score using a heuristic for `target`.
+    /// Get the lower bound score using a heuristic.
     ///
     /// This represents the best possible score of all descendant branches (according to the
     /// heuristic).
     ///
     /// If this returns `None`, the current branch and all descendant branches will not have valid
     /// solutions.
-    fn bound(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32>;
+    fn bound(&mut self, view: &SelectionView<'_>) -> Option<Ordf32>;
 
-    /// The change output (a.k.a. drain) this metric decides on for the given selection and `target`,
+    /// The change output (a.k.a. drain) this metric decides on for the given selection,
     /// or [`Drain::NONE`] if it decides there should be no change.
     ///
     /// Call this on a branch-and-bound solution to get the change output the metric optimized against.
-    fn drain(&mut self, cs: &CoinSelector<'_>) -> Drain;
+    fn drain(&mut self, view: &SelectionView<'_>) -> Drain;
 
     /// Returns whether the metric requies we order candidates by descending value per weight unit.
     fn requires_ordering_by_descending_value_pwu(&self) -> bool {

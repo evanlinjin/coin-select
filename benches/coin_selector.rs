@@ -1,6 +1,9 @@
 //! Benchmarks for `CoinSelector`.
 //!
-//! Three groups:
+//! Groups include selector construction and cloning, cached-view construction, and end-to-end BnB
+//! with and without ancestors. Linear operations cover wallet (~1k) through exchange (~10M) pools;
+//! BnB sizes remain moderate because its search space is exponential.
+//!
 //! - `clone`: direct cost of `CoinSelector::clone()`, the operation `Bitset`
 //!   was introduced to make cheap.
 //! - `run_bnb_lowest_fee`: end-to-end Branch-and-Bound throughput on a
@@ -24,6 +27,9 @@ use bdk_coin_select::{
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use std::hint::black_box;
 
+const LARGE_N: &[usize] = &[64, 1_024, 16_384, 262_144, 1_048_576, 10_000_000];
+const SPARSE_SELECTED: usize = 100;
+
 /// Deterministic synthetic pool of P2WPKH-shaped UTXOs.
 ///
 /// Values grow super-linearly so the pool resembles a real wallet's mix of
@@ -33,7 +39,7 @@ fn make_candidates(n: usize) -> Vec<Candidate> {
     (0..n)
         .map(|i| {
             let i = i as u64;
-            let value = 1_000 + i * 137 + i * i;
+            let value = 1_000 + i.wrapping_mul(137).wrapping_add(i.wrapping_mul(i));
             Candidate {
                 value,
                 weight: TXIN_BASE_WEIGHT + P2WPKH_SAT_W,
@@ -44,10 +50,34 @@ fn make_candidates(n: usize) -> Vec<Candidate> {
         .collect()
 }
 
+fn select_sparse(selector: &mut CoinSelector<'_>, n: usize) {
+    let count = SPARSE_SELECTED.min(n);
+    let stride = (n / count.max(1)).max(1);
+    for index in (0..n).step_by(stride).take(count) {
+        selector.select(index);
+    }
+}
+
+fn bench_coin_selector_new(c: &mut Criterion) {
+    let mut group = c.benchmark_group("new");
+    group.sample_size(20);
+    for &n in LARGE_N {
+        let candidates = make_candidates(n);
+        let (target, _) = make_bnb_inputs(&candidates);
+        let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(CoinSelector::new(&problem)));
+        });
+    }
+    group.finish();
+}
+
 fn make_bnb_inputs(candidates: &[Candidate]) -> (Target, FeeRate) {
     let target_fr = FeeRate::from_sat_per_vb(2.0);
     let long_term_fr = FeeRate::from_sat_per_vb(10.0);
-    let total: u64 = candidates.iter().map(|c| c.value).sum();
+    let total = candidates
+        .iter()
+        .fold(0_u64, |sum, candidate| sum.wrapping_add(candidate.value));
     let target = Target {
         fee: TargetFee::from_feerate(target_fr),
         outputs: TargetOutputs::fund_outputs([(TXOUT_BASE_WEIGHT + TR_SPK_WEIGHT, total / 2)]),
@@ -58,17 +88,31 @@ fn make_bnb_inputs(candidates: &[Candidate]) -> (Target, FeeRate) {
 
 fn bench_coin_selector_clone(c: &mut Criterion) {
     let mut group = c.benchmark_group("clone");
-    for &n in &[64usize, 256, 1024, 4096] {
+    group.sample_size(20);
+    for &n in LARGE_N {
         let candidates = make_candidates(n);
         let (target, _) = make_bnb_inputs(&candidates);
         let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
         let mut selector = CoinSelector::new(&problem);
-        // Select ~10% of candidates so `selected` is non-trivial to copy.
-        for i in (0..n).step_by(10) {
-            selector.select(i);
-        }
+        select_sparse(&mut selector, n);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| black_box(selector.clone()));
+        });
+    }
+    group.finish();
+}
+
+fn bench_compute_view(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compute_view");
+    group.sample_size(20);
+    for &n in LARGE_N {
+        let candidates = make_candidates(n);
+        let (target, _) = make_bnb_inputs(&candidates);
+        let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let mut selector = CoinSelector::new(&problem);
+        select_sparse(&mut selector, n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(selector.compute_view().selected_value()));
         });
     }
     group.finish();
@@ -197,7 +241,9 @@ fn bench_run_bnb_lowest_fee_ancestors(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_coin_selector_new,
     bench_coin_selector_clone,
+    bench_compute_view,
     bench_run_bnb_lowest_fee,
     bench_run_bnb_lowest_fee_ancestors
 );

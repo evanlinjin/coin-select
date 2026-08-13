@@ -55,6 +55,11 @@ impl<'a> CoinSelector<'a> {
         self.problem
     }
 
+    /// Build a cached read-only view of the current selection.
+    pub fn compute_view(&'a self) -> SelectionView<'a> {
+        SelectionView::from_selector(self)
+    }
+
     /// Iterate over all the candidates in their currently sorted order. Each item has the original
     /// index with the candidate.
     pub fn candidates(
@@ -521,25 +526,6 @@ impl<'a> CoinSelector<'a> {
             + self.ancestor_bump()
     }
 
-    /// A lower bound on the fee that this selection — and every selection extending it — must pay.
-    ///
-    /// Every term is monotone in the tx weight and so can only grow as more inputs (or a drain) are
-    /// added. What the ancestors owe is *not* monotone, so this credits only
-    /// [`ancestor_bump_lower_bound`](Self::ancestor_bump_lower_bound) — the least any descendant
-    /// could owe — rather than this selection's actual [`ancestor_bump`](Self::ancestor_bump).
-    ///
-    /// Weight-unit (un-rounded) fees are used throughout, which can only make the floor smaller.
-    pub(crate) fn fee_floor(&self) -> u64 {
-        let weight = self.weight(self.target().outputs, DrainWeights::NONE);
-        let mut floor = (self.target().fee.rate.implied_fee_wu(weight)
-            + self.ancestor_bump_lower_bound())
-        .max(self.target().fee.absolute);
-        if let Some(replace) = self.target().fee.replace {
-            floor = floor.max(replace.min_fee_to_do_replacement_wu(weight));
-        }
-        floor
-    }
-
     /// The actual fee the selection would pay if it was used in a transaction that had
     /// `target_value` value for outputs and change output of `drain_value`.
     ///
@@ -946,7 +932,7 @@ impl<'a> CoinSelector<'a> {
             .flatten()
             .last();
         if let Some((selector, score)) = best {
-            let drain = iter.metric.drain(&selector);
+            let drain = iter.metric.drain(&selector.compute_view());
             *self = selector;
             return Ok((score, drain));
         }
