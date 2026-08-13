@@ -357,7 +357,9 @@ impl<'a> CoinSelector<'a> {
         if bound <= 0.0 {
             0
         } else {
-            bound as u64 // truncating a positive float is the floor, i.e. rounds down
+            // Truncating a positive float rounds down. Account for the lower precision used by the
+            // actual f32 fee calculation so this cannot sit above a descendant's real bump.
+            (bound as u64).saturating_sub(self.problem.ancestor_fee_precision_slack())
         }
     }
 

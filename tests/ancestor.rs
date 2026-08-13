@@ -518,6 +518,25 @@ fn bound_credits_the_bump_when_nothing_overpays() {
     );
 }
 
+#[test]
+fn bump_lower_bound_accounts_for_large_f32_fee_rounding() {
+    let t = target(172.0, 1_000); // exactly 43 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [input(20_000_000, "P")],
+        [ancestor("P", 399_999, 0, vec![])],
+    );
+    let mut cs = problem.selector();
+    cs.select(0);
+
+    assert!(
+        cs.ancestor_bump_lower_bound() <= cs.ancestor_bump(),
+        "the f64 relaxation must not exceed the f32 fee obligation"
+    );
+    let view = cs.compute_view();
+    assert!(view.ancestor_bump_lower_bound() <= view.ancestor_bump());
+}
+
 /// An ancestor only one candidate can reach is folded into that candidate up front; the rest are
 /// left to be de-duplicated per selection.
 #[test]

@@ -163,7 +163,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         let mut inclusion_cs = cs.clone();
         let mut inclusion_cache = cache.clone();
         inclusion_cs.select(next_index);
-        inclusion_cache.add(cs.problem(), next_index, next);
+        inclusion_cache.add(cs.problem(), next_index, next, true);
         self.consider_adding_to_queue(&inclusion_cs, &inclusion_cache, false, cursor + 1);
 
         // For the exclusion branch, we keep banning candidates that are interchangeable with the one
