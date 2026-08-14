@@ -217,6 +217,10 @@ impl SelectionCache {
     pub(crate) fn ban(&mut self, problem: &SelectionProblem, index: usize) {
         self.remove_reachable(problem, index);
     }
+
+    pub(crate) fn unban(&mut self, problem: &SelectionProblem, index: usize) {
+        self.add_reachable(problem, index);
+    }
 }
 
 /// A cached view over a [`CoinSelector`] that supports hypothetical updates.

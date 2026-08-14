@@ -1,191 +1,143 @@
-use core::cmp::Reverse;
-
 use crate::{float::Ordf32, Drain, SelectionCache, SelectionView};
 
 use super::CoinSelector;
-use alloc::collections::BinaryHeap;
+use alloc::vec::Vec;
 
 /// An [`Iterator`] that iterates over rounds of branch and bound to minimize the score of the
 /// provided [`BnbMetric`].
 #[derive(Debug)]
 pub(crate) struct BnbIter<'a, M: BnbMetric> {
-    queue: BinaryHeap<Branch<'a>>,
+    selector: CoinSelector<'a>,
+    cache: SelectionCache,
+    stack: Vec<Frame>,
     best: Option<Ordf32>,
+    exhausted: bool,
     /// The `BnBMetric` that will score each selection
     pub(crate) metric: M,
+}
+
+#[derive(Debug)]
+struct Frame {
+    is_inclusion: bool,
+    index: usize,
+    cursor: usize,
+    next_cursor: usize,
+    banned: Vec<usize>,
+    sibling_pending: bool,
 }
 
 impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
     type Item = Option<(CoinSelector<'a>, Ordf32)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // {
-        //     println!("=========================== {:?}", self.best);
-        //     for thing in self.queue.iter() {
-        //         println!("{} {:?}", &thing.selector, thing.lower_bound);
-        //     }
-        //     let _ = std::io::stdin().read_line(&mut alloc::string::String::new());
-        // }
-
-        let branch = self.queue.pop()?;
-        if let Some(best) = &self.best {
-            // If the next thing in queue is not better than our best we're done.
-            if *best < branch.lower_bound {
-                // println!(
-                //     "\t\t(SKIP) branch={} inclusion={} lb={:?}, score={:?}",
-                //     branch.selector,
-                //     !branch.is_exclusion,
-                //     branch.lower_bound,
-                //     self.metric.score(&branch.selector),
-                // );
-                return None;
-            }
-        }
-        // println!(
-        //     "\t\t( POP) branch={} inclusion={} lb={:?}, score={:?}",
-        //     branch.selector,
-        //     !branch.is_exclusion,
-        //     branch.lower_bound,
-        //     self.metric.score(&branch.selector),
-        // );
-
-        let Branch {
-            selector,
-            cache,
-            is_exclusion,
-            cursor,
-            ..
-        } = branch;
-
-        let mut return_val = None;
-        if !is_exclusion {
-            if let Some(score) = self
-                .metric
-                .score(&SelectionView::with_cache(&selector, &cache))
-            {
-                let better = match self.best {
-                    Some(best_score) => score < best_score,
-                    None => true,
-                };
-                if better {
-                    self.best = Some(score);
-                    return_val = Some(score);
-                }
-            };
+        if self.exhausted {
+            return None;
         }
 
-        self.insert_new_branches(&selector, &cache, cursor);
-        Some(return_val.map(|score| (selector, score)))
+        let return_val = if !self.is_exclusion_node() {
+            self.try_record_best()
+                .map(|score| (self.selector.clone(), score))
+        } else {
+            None
+        };
+
+        if !self.descend() && !self.backtrack_to_next_branch() {
+            self.exhausted = true;
+        }
+
+        Some(return_val)
     }
 }
 
 impl<'a, M: BnbMetric> BnbIter<'a, M> {
     pub(crate) fn new(mut selector: CoinSelector<'a>, metric: M) -> Self {
-        let mut iter = BnbIter {
-            queue: BinaryHeap::default(),
-            best: None,
-            metric,
-        };
-
-        if iter.metric.requires_ordering_by_descending_value_pwu() {
+        if metric.requires_ordering_by_descending_value_pwu() {
             selector.sort_candidates_by_descending_value_pwu();
         }
 
         let cache = SelectionCache::from_selector(&selector);
-        iter.consider_adding_to_queue(&selector, &cache, false, 0);
+        let mut iter = BnbIter {
+            selector,
+            cache,
+            stack: Vec::new(),
+            best: None,
+            exhausted: false,
+            metric,
+        };
+
+        if !iter.bound_is_promising() {
+            iter.exhausted = true;
+        }
 
         iter
     }
 
-    fn consider_adding_to_queue(
-        &mut self,
-        cs: &CoinSelector<'a>,
-        cache: &SelectionCache,
-        is_exclusion: bool,
-        cursor: usize,
-    ) {
-        let bound = self.metric.bound(&SelectionView::with_cache(cs, cache));
-        if let Some(bound) = bound {
-            let is_good_enough = match self.best {
-                Some(best) => best > bound,
-                None => true,
-            };
-            if is_good_enough {
-                let branch = Branch {
-                    lower_bound: bound,
-                    selector: cs.clone(),
-                    cache: cache.clone(),
-                    is_exclusion,
-                    cursor,
-                };
-                /*println!(
-                    "\t\t(PUSH) branch={} inclusion={} lb={:?} score={:?}",
-                    branch.selector,
-                    !branch.is_exclusion,
-                    branch.lower_bound,
-                    self.metric.score(&branch.selector),
-                );*/
-                self.queue.push(branch);
-            } /* else {
-                  println!(
-                      "\t\t( REJ) branch={} inclusion={} lb={:?} score={:?}",
-                      cs,
-                      !is_exclusion,
-                      bound,
-                      self.metric.score(cs),
-                  );
-              }*/
-        } /*else {
-              println!(
-                  "\t\t(NO B) branch={} inclusion={} score={:?}",
-                  cs,
-                  !is_exclusion,
-                  self.metric.score(cs),
-              );
-          }*/
+    fn is_exclusion_node(&self) -> bool {
+        self.stack.last().map_or(false, |frame| !frame.is_inclusion)
     }
 
-    fn insert_new_branches(&mut self, cs: &CoinSelector<'a>, cache: &SelectionCache, start: usize) {
-        let mut iter = cs.candidates().skip(start);
-        let mut cursor = start;
-        let (next_index, next) = loop {
-            match iter.next() {
-                None => return,
-                Some((index, candidate)) => {
-                    if !cs.is_selected(index) && !cs.banned().contains(index) {
-                        break (index, candidate);
-                    }
-                    cursor += 1;
-                }
-            }
+    fn try_record_best(&mut self) -> Option<Ordf32> {
+        let score = self
+            .metric
+            .score(&SelectionView::with_cache(&self.selector, &self.cache))?;
+        let better = match self.best {
+            Some(best_score) => score < best_score,
+            None => true,
         };
+        if better {
+            self.best = Some(score);
+            Some(score)
+        } else {
+            None
+        }
+    }
 
-        let mut inclusion_cs = cs.clone();
-        let mut inclusion_cache = cache.clone();
-        inclusion_cs.select(next_index);
-        inclusion_cache.add(cs.problem(), next_index, next, true);
-        self.consider_adding_to_queue(&inclusion_cs, &inclusion_cache, false, cursor + 1);
+    fn bound_of_current(&mut self) -> Option<Ordf32> {
+        self.metric
+            .bound(&SelectionView::with_cache(&self.selector, &self.cache))
+    }
 
-        // For the exclusion branch, we keep banning candidates that are interchangeable with the one
-        // we just excluded: same value and weight, and dragging in exactly the same unconfirmed
-        // ancestors (two coins of equal value and weight are *not* interchangeable if one of them
-        // drags in an ancestor that needs bumping). Candidates are only compared until the first
-        // mismatch, since this exploits them being adjacent in the sorted order.
-        let mut exclusion_cs = cs.clone();
-        let mut exclusion_cache = cache.clone();
+    fn is_promising(&self, bound: Option<Ordf32>) -> bool {
+        match (bound, self.best) {
+            (Some(bound), Some(best)) => best > bound,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    fn bound_is_promising(&mut self) -> bool {
+        let bound = self.bound_of_current();
+        self.is_promising(bound)
+    }
+
+    fn cursor(&self) -> usize {
+        self.stack.last().map_or(0, |frame| frame.next_cursor)
+    }
+
+    fn next_candidate(&self, start: usize) -> Option<(usize, usize)> {
+        for (cursor, (index, _)) in (start..).zip(self.selector.candidates().skip(start)) {
+            if !self.selector.is_selected(index) && !self.selector.banned().contains(index) {
+                return Some((index, cursor));
+            }
+        }
+        None
+    }
+
+    fn exclusion_plan(&self, index: usize, cursor: usize) -> (Vec<usize>, usize) {
+        let next = self.selector.candidate(index);
         let to_ban = (
             next.value,
             next.weight,
             next.segwit_count,
             next.legacy_count,
         );
-        let to_ban_drags_in = cs.problem().drags_in(next_index);
-        exclusion_cs.ban(next_index);
-        exclusion_cache.ban(cs.problem(), next_index);
-        let mut exclusion_cursor = cursor + 1;
-        for (next_index, next) in iter {
-            if cs.is_selected(next_index) || cs.banned().contains(next_index) {
-                exclusion_cursor += 1;
+        let to_ban_drags_in = self.selector.problem().drags_in(index);
+        let mut banned = alloc::vec![index];
+        let mut next_cursor = cursor + 1;
+        for (next_index, next) in self.selector.candidates().skip(cursor + 1) {
+            if self.selector.is_selected(next_index) || self.selector.banned().contains(next_index)
+            {
+                next_cursor += 1;
                 continue;
             }
             if (
@@ -194,54 +146,160 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
                 next.segwit_count,
                 next.legacy_count,
             ) != to_ban
-                || cs.problem().drags_in(next_index) != to_ban_drags_in
+                || self.selector.problem().drags_in(next_index) != to_ban_drags_in
             {
                 break;
             }
-            exclusion_cs.ban(next_index);
-            exclusion_cache.ban(cs.problem(), next_index);
-            exclusion_cursor += 1;
+            banned.push(next_index);
+            next_cursor += 1;
         }
-        self.consider_adding_to_queue(&exclusion_cs, &exclusion_cache, true, exclusion_cursor);
+        (banned, next_cursor)
+    }
+
+    fn apply_include(&mut self, index: usize) {
+        let candidate = self.selector.candidate(index);
+        self.selector.select(index);
+        self.cache
+            .add(self.selector.problem(), index, candidate, true);
+    }
+
+    fn undo_include(&mut self, index: usize) {
+        let candidate = self.selector.candidate(index);
+        self.selector.deselect(index);
+        self.cache
+            .sub(self.selector.problem(), index, candidate, true);
+    }
+
+    fn apply_exclude(&mut self, banned: &[usize]) {
+        for &index in banned {
+            self.selector.ban(index);
+            self.cache.ban(self.selector.problem(), index);
+        }
+    }
+
+    fn undo_exclude(&mut self, banned: &[usize]) {
+        for &index in banned.iter().rev() {
+            self.selector.unban(index);
+            self.cache.unban(self.selector.problem(), index);
+        }
+    }
+
+    fn push_include(&mut self, index: usize, cursor: usize, sibling_pending: bool) {
+        self.apply_include(index);
+        self.stack.push(Frame {
+            is_inclusion: true,
+            index,
+            cursor,
+            next_cursor: cursor + 1,
+            banned: Vec::new(),
+            sibling_pending,
+        });
+    }
+
+    fn push_exclude(
+        &mut self,
+        index: usize,
+        cursor: usize,
+        banned: Vec<usize>,
+        next_cursor: usize,
+        sibling_pending: bool,
+    ) {
+        self.apply_exclude(&banned);
+        self.stack.push(Frame {
+            is_inclusion: false,
+            index,
+            cursor,
+            next_cursor,
+            banned,
+            sibling_pending,
+        });
+    }
+
+    fn descend(&mut self) -> bool {
+        let (index, cursor) = match self.next_candidate(self.cursor()) {
+            Some(next) => next,
+            None => return false,
+        };
+
+        self.apply_include(index);
+        let inc_bound = self.bound_of_current();
+        let inc_ok = self.is_promising(inc_bound);
+        self.undo_include(index);
+
+        let (banned, exc_next_cursor) = self.exclusion_plan(index, cursor);
+        self.apply_exclude(&banned);
+        let exc_bound = self.bound_of_current();
+        let exc_ok = self.is_promising(exc_bound);
+        self.undo_exclude(&banned);
+
+        match (inc_ok, exc_ok) {
+            (false, false) => false,
+            (true, false) => {
+                self.push_include(index, cursor, false);
+                true
+            }
+            (false, true) => {
+                self.push_exclude(index, cursor, banned, exc_next_cursor, false);
+                true
+            }
+            (true, true) => {
+                // Equal bounds prefer inclusion, matching the previous best-first tie-break.
+                let include_first = match (inc_bound, exc_bound) {
+                    (Some(inc), Some(exc)) => inc <= exc,
+                    _ => true,
+                };
+                if include_first {
+                    self.push_include(index, cursor, true);
+                } else {
+                    self.push_exclude(index, cursor, banned, exc_next_cursor, true);
+                }
+                true
+            }
+        }
+    }
+
+    fn backtrack_to_next_branch(&mut self) -> bool {
+        while let Some(frame) = self.stack.pop() {
+            if frame.is_inclusion {
+                self.undo_include(frame.index);
+                if frame.sibling_pending {
+                    let (banned, next_cursor) = self.exclusion_plan(frame.index, frame.cursor);
+                    self.apply_exclude(&banned);
+                    if self.bound_is_promising() {
+                        self.stack.push(Frame {
+                            is_inclusion: false,
+                            index: frame.index,
+                            cursor: frame.cursor,
+                            next_cursor,
+                            banned,
+                            sibling_pending: false,
+                        });
+                        return true;
+                    }
+                    self.undo_exclude(&banned);
+                }
+            } else {
+                self.undo_exclude(&frame.banned);
+                if frame.sibling_pending {
+                    self.apply_include(frame.index);
+                    if self.bound_is_promising() {
+                        self.stack.push(Frame {
+                            is_inclusion: true,
+                            index: frame.index,
+                            cursor: frame.cursor,
+                            next_cursor: frame.cursor + 1,
+                            banned: Vec::new(),
+                            sibling_pending: false,
+                        });
+                        return true;
+                    }
+                    self.undo_include(frame.index);
+                }
+            }
+        }
+        false
     }
 }
-
-#[derive(Debug, Clone)]
-struct Branch<'a> {
-    lower_bound: Ordf32,
-    selector: CoinSelector<'a>,
-    cache: SelectionCache,
-    is_exclusion: bool,
-    cursor: usize,
-}
-
-impl Ord for Branch<'_> {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // NOTE: Reverse comparison `lower_bound` because we want a min-heap (by default BinaryHeap
-        // is a max-heap).
-        // NOTE: We tiebreak equal scores based on whether it's exlusion or not (preferring
-        // inclusion). We do this because we want to try and get to evaluating complete selection
-        // returning actual scores as soon as possible.
-        core::cmp::Ord::cmp(
-            &(Reverse(&self.lower_bound), !self.is_exclusion),
-            &(Reverse(&other.lower_bound), !other.is_exclusion),
-        )
-    }
-}
-
-impl PartialOrd for Branch<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Branch<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.lower_bound == other.lower_bound
-    }
-}
-
-impl Eq for Branch<'_> {}
 
 /// A branch and bound metric where we minimize the [`Ordf32`] score.
 ///

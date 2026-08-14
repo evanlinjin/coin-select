@@ -8,8 +8,8 @@
 //!   was introduced to make cheap.
 //! - `run_bnb_lowest_fee`: end-to-end Branch-and-Bound solution finding on a deterministic
 //!   synthetic pool using the `LowestFee` metric.
-//! - `run_bnb_lowest_fee_exhaust_cap`: frontier expansion at sizes that exhaust the fixed round
-//!   cap, isolating the cache and cursor hot path.
+//! - `run_bnb_lowest_fee_exhaust_cap`: large-pool BnB under the same fixed round cap. DFS still
+//!   produces a solution at these sizes; the cap mainly limits how long we spend proving it.
 //! - `run_bnb_lowest_fee_ancestors`: the same, but where the coins sit on unconfirmed ancestors that
 //!   need bumping — covering both the private and shared ancestor paths, which cost different
 //!   amounts per fee calculation.
@@ -170,7 +170,7 @@ fn bench_run_bnb_lowest_fee_exhaust_cap(c: &mut Criterion) {
         c,
         "run_bnb_lowest_fee_exhaust_cap",
         &[200, 500, 1_000],
-        false,
+        true,
     );
 }
 
