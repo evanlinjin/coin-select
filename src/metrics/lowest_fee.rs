@@ -29,8 +29,9 @@ use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionVie
 /// The bound uses a child-weight relaxation when ancestors are present (see
 /// [`bound`](BnbMetric::bound)): a funded node credits reachable ancestor surplus and possible future
 /// change, clamped to the monotone fee floor, while an unfunded one estimates the least child weight
-/// needed to meet each fee constraint. The `None` prunes stay off: funding is not monotone, so
-/// "select everything and it is still unfunded" does not mean the subtree is empty.
+/// needed to meet each fee constraint. That relaxation may call a subtree empty only when the most
+/// optimistic input still available cannot close a deficit — never from "select everything and it is
+/// still unfunded", which does not follow while funding is not monotone.
 ///
 /// [`SelectionProblem`]: crate::SelectionProblem
 #[derive(Clone, Copy)]
@@ -126,15 +127,17 @@ impl LowestFee {
     /// Tighter than [`CoinSelector::fee_floor`] once the value shortfall proves that every funded
     /// descendant must add some child input weight.
     ///
-    /// Never returns `None`: a fat private deficit can un-fund a prefix that a subset would have
-    /// funded, so infeasibility is not something this path is allowed to claim. (The caller has
-    /// already hard-pruned on child `max_weight`, which is monotone.)
+    /// Returns `None` only for the one infeasibility this relaxation can actually prove: a fee
+    /// constraint whose deficit the best input still available cannot close at any weight. It is
+    /// *not* allowed to reason from "select everything and it is still unfunded" — a fat private
+    /// deficit can un-fund a prefix that a subset would have funded. (The caller has already
+    /// hard-pruned on child `max_weight`, which is monotone.)
     ///
     /// The three fee constraints get independent fractional relaxations. Their maximum is still a
     /// lower bound on the real added child weight. Candidate ancestry is ignored and the global bump
     /// floor is used instead, avoiding package-surplus double counting. Flooring the fractional
     /// weight keeps floating-point error in the safe direction.
-    fn bound_with_ancestors(&self, cs: &SelectionView<'_>) -> Ordf32 {
+    fn bound_with_ancestors(&self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         if cs.is_funded() {
             let (_, drain) = self.fee_score(cs).unwrap();
             let current_score = cs.fee(cs.target().value(), drain.value) as u64
@@ -159,7 +162,7 @@ impl LowestFee {
                     bound = bound.min(with_change);
                 }
             }
-            return Ordf32(bound.max(cs.fee_floor()) as f32);
+            return Some(Ordf32(bound.max(cs.fee_floor()) as f32));
         }
 
         let target = cs.target();
@@ -196,6 +199,22 @@ impl LowestFee {
         let best_rate_gain = (best_value - target_rate).max(0.0);
         let best_replace_gain = (best_value - replace_rate).max(0.0);
 
+        // Bitcoin Core computes `is_feerate_high` once and lets it decide whether a prune that is
+        // only sometimes valid may fire, rather than dropping the prune outright. Same shape here.
+        // A deficit that no available input can close at any weight is not a claim about
+        // monotonicity: descendants only add, the deficit already uses the branch-wide bump floor,
+        // and the gain already ignores whatever ancestors those inputs would drag in. So this much
+        // infeasibility is provable even though the general case is not, and saying so prunes the
+        // subtree instead of ranking it.
+        let unreachable =
+            |deficit: f64, gain_pwu: f64| !weightless_value && deficit > 0.0 && gain_pwu <= 0.0;
+        if unreachable(rate_deficit, best_rate_gain)
+            || unreachable(absolute_deficit, best_value)
+            || unreachable(replace_deficit, best_replace_gain)
+        {
+            return None;
+        }
+
         // Treat the best candidate as unlimited fractional input. If no positive gain is available,
         // or a positive-value zero-weight candidate exists, fall back to zero added weight rather
         // than claiming infeasibility.
@@ -211,13 +230,13 @@ impl LowestFee {
         let added_weight = added_weight as u64;
         let weight = match current_weight.checked_add(added_weight) {
             Some(weight) if added_weight != u64::MAX => weight,
-            _ => return Ordf32(cs.fee_floor() as f32),
+            _ => return Some(Ordf32(cs.fee_floor() as f32)),
         };
         let mut bound = (target.fee.rate.implied_fee_wu(weight) + bump).max(target.fee.absolute);
         if let Some(replace) = target.fee.replace {
             bound = bound.max(replace.min_fee_to_do_replacement_wu(weight));
         }
-        Ordf32(bound as f32)
+        Some(Ordf32(bound as f32))
     }
 }
 
@@ -254,7 +273,7 @@ impl BnbMetric for LowestFee {
         // With unconfirmed ancestors, funding is not monotone. Use the child-weight relaxation in
         // `bound_with_ancestors`; never claim the subtree is empty.
         if cs.problem().has_ancestors() {
-            return Some(self.bound_with_ancestors(cs));
+            return self.bound_with_ancestors(cs);
         }
 
         if cs.is_funded() {
