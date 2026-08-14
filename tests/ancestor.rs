@@ -393,6 +393,269 @@ fn changeless_solution_reachable_only_via_an_ancestor_is_not_pruned() {
     assert_eq!(score, Ordf32(11_000.0));
 }
 
+// --- the bump lower bound used by `LowestFee`'s bound ---
+
+/// With nothing overpaying within reach, no descendant can owe less than this selection does, so the
+/// lower bound is the full bump — the figure branch and bound gets to keep.
+#[test]
+fn bump_lower_bound_is_the_full_bump_when_nothing_overpays() {
+    let t = target(10.0, 10_000);
+    let problem = SelectionProblem::new(
+        t,
+        [
+            input(50_000, "P"),
+            input(60_000, "Q"),
+            input(70_000, CONFIRMED),
+        ],
+        [
+            ancestor("P", 1_000, 0, vec![]),
+            ancestor("Q", 2_000, 0, vec![]),
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    assert_eq!(cs.ancestor_bump(), 2_500);
+    assert_eq!(
+        cs.ancestor_bump_lower_bound(),
+        2_500,
+        "Q only ever adds to what is owed, so it cannot lower the floor"
+    );
+
+    // The reachable-but-unselected ancestors are exactly Q's.
+    let addable: Vec<_> = cs.addable_ancestors().iter().collect();
+    assert_eq!(addable, vec![1]);
+}
+
+/// A reachable ancestor that overpays is exactly what a descendant could use to owe less, so the
+/// bound gives up precisely that surplus and no more.
+#[test]
+fn bump_lower_bound_gives_up_the_reachable_surplus() {
+    let t = target(1.0, 10_000); // 0.25 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [input(50_000, "POOR"), input(50_000, "RICH")],
+        [
+            ancestor("POOR", 4_000, 0, vec![]),    // owes 1_000
+            ancestor("RICH", 400, 10_000, vec![]), // overpays by 9_900
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(
+        cs.ancestor_bump_lower_bound(),
+        0,
+        "RICH's 9_900 surplus swamps the 1_000 owed"
+    );
+
+    // Which is not pessimism: that descendant really does owe nothing.
+    let mut both = cs.clone();
+    both.select(1);
+    assert_eq!(both.ancestor_bump(), 0);
+}
+
+/// Only the surplus actually within reach is given up.
+#[test]
+fn bump_lower_bound_only_credits_reachable_surplus() {
+    let t = target(1.0, 10_000); // 0.25 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [input(50_000, "POOR"), input(50_000, "RICH")],
+        [
+            ancestor("POOR", 4_000, 0, vec![]),   // owes 1_000
+            ancestor("RICH", 400, 1_100, vec![]), // overpays by 1_000
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.ancestor_bump_lower_bound(), 0);
+
+    // Ban the coin that would bring RICH in and the surplus is out of reach again.
+    let mut banned = cs.clone();
+    banned.ban(1);
+    assert!(banned.addable_ancestors().is_empty());
+    assert_eq!(banned.ancestor_bump_lower_bound(), 1_000);
+
+    // Likewise once there is nothing left to add.
+    let mut exhausted = cs.clone();
+    exhausted.select(1);
+    assert!(exhausted.is_exhausted());
+    assert_eq!(
+        exhausted.ancestor_bump_lower_bound(),
+        exhausted.ancestor_bump()
+    );
+}
+
+/// The whole point: the fee floor `LowestFee` bounds with actually charges for the ancestors.
+#[test]
+fn bound_credits_the_bump_when_nothing_overpays() {
+    let t = target(10.0, 90_000);
+    let problem = SelectionProblem::new(
+        t,
+        [input(100_000, "P"), input(100_000, CONFIRMED)],
+        [ancestor("P", 1_000, 0, vec![])],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+
+    let child_fee = t
+        .fee
+        .rate
+        .implied_fee_wu(cs.weight(t.outputs, DrainWeights::NONE));
+    let bound = metric().bound(&cs).expect("within max_weight");
+    assert!(
+        bound >= Ordf32((child_fee + 2_500) as f32),
+        "bound {} must charge the child's own fee ({}) plus the 2_500 bump",
+        bound,
+        child_fee
+    );
+}
+
+/// An ancestor only one candidate can reach is folded into that candidate up front; the rest are
+/// left to be de-duplicated per selection.
+#[test]
+fn ancestors_are_split_into_private_and_shared() {
+    let t = target(10.0, 10_000);
+    let problem = SelectionProblem::new(
+        t,
+        [
+            vec![input(50_000, "MINE")],
+            vec![input(50_000, "OURS")],
+            vec![input(50_000, "OURS")],
+        ],
+        [
+            ancestor("MINE", 1_000, 7, vec![]),
+            ancestor("OURS", 2_000, 9, vec![]),
+        ],
+    );
+
+    assert!(problem.has_shared_ancestors());
+
+    // Candidate 0 is the only one that can reach MINE, so it is charged for it directly.
+    assert_eq!(problem.private_ancestors(0), (1_000, 7));
+    assert!(problem.shared_drags_in(0).is_empty());
+
+    // OURS is reachable two ways, so it stays in the shared set for both.
+    assert_eq!(problem.private_ancestors(1), (0, 0));
+    assert_eq!(problem.private_ancestors(2), (0, 0));
+    assert_eq!(
+        problem.shared_drags_in(1).iter().collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        problem.shared_drags_in(2).iter().collect::<Vec<_>>(),
+        vec![1]
+    );
+
+    // Either way `drags_in` still describes the full truth.
+    assert_eq!(problem.drags_in(0).iter().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(problem.drags_in(1).iter().collect::<Vec<_>>(), vec![1]);
+
+    // And a problem where nothing is shared says so, which is what lets the bump skip
+    // de-duplication entirely.
+    let unshared = SelectionProblem::new(
+        t,
+        [input(50_000, "MINE")],
+        [ancestor("MINE", 1_000, 0, vec![])],
+    );
+    assert!(!unshared.has_shared_ancestors());
+    assert!(unshared.has_ancestors());
+}
+
+/// Surplus cannot be cherry-picked: an ancestor arrives only by selecting a candidate, which drags
+/// in that candidate's whole chain. So a coin whose parent overpays but whose grandparent does not
+/// offers no way to owe less, and the bound must not pretend otherwise.
+#[test]
+fn bump_lower_bound_nets_ancestors_that_must_arrive_together() {
+    let t = target(1.0, 10_000); // 0.25 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [input(50_000, "POOR"), input(50_000, "RICH")],
+        [
+            ancestor("POOR", 4_000, 0, vec![]), // owes 1_000
+            // Selecting the second coin brings RICH *and* its unpaid parent GRAN.
+            ancestor("GRAN", 8_000, 0, vec![]), // owes 2_000
+            ancestor("RICH", 400, 10_000, vec!["GRAN"]), // overpays by 9_900
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    assert_eq!(cs.ancestor_bump(), 1_000);
+
+    // RICH's 9_900 surplus is real, but only comes with GRAN's 2_000 deficit: still a net surplus.
+    assert_eq!(cs.ancestor_bump_lower_bound(), 0);
+    let mut both = cs.clone();
+    both.select(1);
+    assert_eq!(
+        both.ancestor_bump(),
+        0,
+        "that descendant really owes nothing"
+    );
+
+    // Now make the chain's deficit outweigh the surplus. Crediting RICH alone would wrongly drop the
+    // bound to 0; netting the chain keeps the full bump.
+    let deep = SelectionProblem::new(
+        t,
+        [input(50_000, "POOR"), input(50_000, "RICH")],
+        [
+            ancestor("POOR", 4_000, 0, vec![]),
+            ancestor("GRAN", 80_000, 0, vec![]), // owes 20_000
+            ancestor("RICH", 400, 10_000, vec!["GRAN"]),
+        ],
+    );
+    let mut cs = deep.selector();
+    cs.select(0);
+    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(
+        cs.ancestor_bump_lower_bound(),
+        1_000,
+        "taking RICH means taking GRAN, which costs far more than RICH's surplus is worth"
+    );
+
+    let mut both = cs.clone();
+    both.select(1);
+    assert!(
+        both.ancestor_bump() > 1_000,
+        "confirmed by the descendant, which owes more, not less"
+    );
+}
+
+/// An ancestor several candidates can reach cannot be tied to any one of them, so its surplus is
+/// credited on its own rather than netted against a particular candidate's other ancestors.
+#[test]
+fn bump_lower_bound_credits_shared_surplus_on_its_own() {
+    let t = target(1.0, 10_000); // 0.25 sat/wu
+    let problem = SelectionProblem::new(
+        t,
+        [
+            vec![input(50_000, "POOR")],
+            // Both of these reach RICH; the second also drags in its own expensive chain.
+            vec![input(50_000, "RICH")],
+            vec![input(50_000, "RICH"), input(50_000, "HEAVY")],
+        ],
+        [
+            ancestor("POOR", 4_000, 0, vec![]),    // owes 1_000
+            ancestor("RICH", 400, 10_000, vec![]), // overpays by 9_900
+            ancestor("HEAVY", 80_000, 0, vec![]),  // owes 20_000
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(
+        cs.ancestor_bump_lower_bound(),
+        0,
+        "RICH is reachable without HEAVY, so its surplus counts"
+    );
+}
+
 // --- randomized cross-checks ---
 
 /// Spec for a randomly generated ancestor problem. Indices are taken modulo the relevant length so
@@ -497,6 +760,40 @@ proptest! {
                 expected_bump(&problem, &node, feerate),
                 "selection={}", node
             );
+        }
+    }
+
+    /// The bump lower bound must hold for the whole subtree, which is what lets the fee floor credit
+    /// it: no selection reachable from a node may owe less than the node's bound says.
+    #[test]
+    fn bump_lower_bound_holds_for_every_descendant(spec in spec_strategy()) {
+        let problem = spec.build();
+        let root = problem.selector();
+
+        let nodes = std::iter::once(root.clone()).chain(
+            common::ExhaustiveIter::new(&root)
+                .into_iter()
+                .flatten()
+                .map(|(node, _)| node),
+        );
+
+        for node in nodes {
+            let lower_bound = node.ancestor_bump_lower_bound();
+            prop_assert!(
+                lower_bound <= node.ancestor_bump(),
+                "node={} lb={} owes={}", node, lower_bound, node.ancestor_bump()
+            );
+
+            for (descendant, inclusion) in common::ExhaustiveIter::new(&node).into_iter().flatten() {
+                if !inclusion {
+                    continue;
+                }
+                prop_assert!(
+                    lower_bound <= descendant.ancestor_bump(),
+                    "node={} lb={} descendant={} owes={}",
+                    node, lower_bound, descendant, descendant.ancestor_bump()
+                );
+            }
         }
     }
 
