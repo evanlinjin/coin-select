@@ -1,7 +1,8 @@
 # Unreleased
 
 - **Breaking:** Replace `Candidate`'s `input_count` and `is_segwit` fields with `segwit_count` and `legacy_count`, fixing `CoinSelector::input_weight` undercounting candidates that group multiple inputs: in a segwit transaction every legacy input still serializes an empty witness (1 WU), which was previously paid once per candidate instead of once per legacy input, so a group of N legacy inputs came out N-1 WU short. Splitting the count by script type also means a single candidate may now mix legacy and segwit inputs and still be priced exactly. Replaces `Candidate::new` with `Candidate::new_segwit` and `Candidate::new_legacy`.
-- **Breaking:** `BnbMetric`'s `score`, `bound`, and `drain` take the `target: Target` as a parameter, and `CoinSelector::run_bnb`/`bnb_solutions` gain a leading `target` argument. Consequently `LowestFee` and `Changeless` no longer store a `target` field. This removes the target that `Changeless<M>` previously had to keep in sync with its inner metric, and aligns the metric API with the rest of `CoinSelector`, where `target` is always passed in.
+- Add `SelectionView`, a cached read-only view obtained with `CoinSelector::compute_view`. `BnbMetric::{score, bound, drain}` now consume `&SelectionView`; branch and bound maintains its aggregates incrementally while the selector continues to own its `SelectionProblem` and target.
+- Add a per-branch cursor to avoid repeatedly scanning already-decided candidates during branch-and-bound search.
 - **Breaking:** `BnbMetric` metrics now decide the change output themselves. The trait gains a `drain(&mut self, cs) -> Drain` method; call it on a branch-and-bound solution (or the `LowestFee` metric directly) to get the change output the metric optimized against, instead of computing a separate `ChangePolicy`.
 - **Breaking:** `CoinSelector::run_bnb` now returns `(Ordf32, Drain)` instead of just `Ordf32`, handing back the change output the metric decided on for the winning selection.
 - **Breaking:** `LowestFee` no longer takes a `change_policy`. It now takes `dust_relay_feerate: FeeRate` and `drain_weights: DrainWeights`, and adds change only when doing so lowers the long-term fee and the change would not be dust.
@@ -28,4 +29,3 @@
 - No more `base_weight` in `CoinSelector`. Weight of the outputs is tracked in `target`.
 - You now account for the number of outputs in both drain and target and their weight.
 - Removed waste metric because it was pretty broken and took a lot to maintain
-

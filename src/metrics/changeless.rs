@@ -1,4 +1,4 @@
-use crate::{bnb::BnbMetric, float::Ordf32, CoinSelector, Drain};
+use crate::{bnb::BnbMetric, float::Ordf32, Drain, SelectionView};
 
 /// Constrains an `inner` metric to only changeless solutions.
 ///
@@ -31,7 +31,7 @@ impl<M: BnbMetric> Changeless<M> {
     /// rather than risk discarding a branch that does contain a changeless solution.
     ///
     /// [`requires_ordering_by_descending_value_pwu`]: BnbMetric::requires_ordering_by_descending_value_pwu
-    fn change_unavoidable(&mut self, cs: &CoinSelector<'_>) -> bool {
+    fn change_unavoidable(&mut self, cs: &SelectionView<'_>) -> bool {
         if cs.problem().has_ancestors() {
             return false;
         }
@@ -45,7 +45,7 @@ impl<M: BnbMetric> Changeless<M> {
             .rev()
             .take_while(|(_, wv)| wv.effective_value(cs.target().fee.rate) < 0.0)
             .for_each(|(index, _)| {
-                least_excess.select(index);
+                least_excess.add(index);
             });
 
         self.0.drain(&least_excess).is_some()
@@ -53,12 +53,12 @@ impl<M: BnbMetric> Changeless<M> {
 }
 
 impl<M: BnbMetric> BnbMetric for Changeless<M> {
-    fn drain(&mut self, _cs: &CoinSelector<'_>) -> Drain {
+    fn drain(&mut self, _cs: &SelectionView<'_>) -> Drain {
         // by definition a changeless selection never has a change output
         Drain::NONE
     }
 
-    fn score(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
+    fn score(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         // Reject selections that have change. We don't need an explicit target-met check: `inner`
         // returns `None` for invalid (e.g. not-target-met) selections.
         //
@@ -71,7 +71,7 @@ impl<M: BnbMetric> BnbMetric for Changeless<M> {
         self.0.score(cs)
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>) -> Option<Ordf32> {
+    fn bound(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         if self.change_unavoidable(cs) {
             // every descendant has change, so no changeless solution is reachable
             None

@@ -1,0 +1,608 @@
+//! Cached, read-only selection queries.
+
+use alloc::{borrow::Cow, vec::Vec};
+use core::ops::Deref;
+
+#[allow(unused)]
+use crate::float::FloatExt;
+use crate::{
+    varint_size, Bitset, Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, FeeRate,
+    SelectionProblem, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
+};
+
+/// Running aggregates used by branch and bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectionCache {
+    value_sum: u64,
+    weight_sum: u64,
+    segwit_count: usize,
+    legacy_count: usize,
+    private_weight: u64,
+    private_fee: u64,
+    shared_refcounts: Vec<u32>,
+    shared_weight: u64,
+    shared_fee: u64,
+    selected: Bitset,
+}
+
+impl SelectionCache {
+    pub(crate) fn from_selector(selector: &CoinSelector<'_>) -> Self {
+        let mut cache = Self {
+            value_sum: 0,
+            weight_sum: 0,
+            segwit_count: 0,
+            legacy_count: 0,
+            private_weight: 0,
+            private_fee: 0,
+            shared_refcounts: alloc::vec![0; selector.problem().ancestors().len()],
+            shared_weight: 0,
+            shared_fee: 0,
+            selected: Bitset::with_capacity(if selector.problem().has_ancestors() {
+                selector.problem().len()
+            } else {
+                0
+            }),
+        };
+        for (index, candidate) in selector.selected() {
+            cache.add(selector.problem(), index, candidate);
+        }
+        cache
+    }
+
+    fn input_weight(&self) -> u64 {
+        let is_segwit_tx = self.segwit_count > 0;
+        let witness_header_extra_weight = is_segwit_tx as u64 * 2;
+        let input_count = self.segwit_count + self.legacy_count;
+        let input_varint_weight = varint_size(input_count) * 4;
+        let legacy_witness_lengths = is_segwit_tx as u64 * self.legacy_count as u64;
+        input_varint_weight + self.weight_sum + legacy_witness_lengths + witness_header_extra_weight
+    }
+
+    pub(crate) fn add(&mut self, problem: &SelectionProblem, index: usize, candidate: Candidate) {
+        if problem.has_ancestors() && !self.selected.insert(index) {
+            return;
+        }
+        self.value_sum += candidate.value;
+        self.weight_sum += candidate.weight;
+        self.segwit_count += candidate.segwit_count;
+        self.legacy_count += candidate.legacy_count;
+
+        if problem.has_private_ancestors() {
+            let (weight, fee) = problem.private_ancestors(index);
+            self.private_weight += weight;
+            self.private_fee += fee;
+        }
+        if problem.has_shared_ancestors() {
+            for ancestor in problem.shared_drags_in(index).iter() {
+                if self.shared_refcounts[ancestor] == 0 {
+                    let (weight, fee) = problem.ancestors()[ancestor];
+                    self.shared_weight += weight;
+                    self.shared_fee += fee;
+                }
+                self.shared_refcounts[ancestor] += 1;
+            }
+        }
+    }
+
+    pub(crate) fn sub(&mut self, problem: &SelectionProblem, index: usize, candidate: Candidate) {
+        if problem.has_ancestors() && !self.selected.remove(index) {
+            return;
+        }
+        self.value_sum -= candidate.value;
+        self.weight_sum -= candidate.weight;
+        self.segwit_count -= candidate.segwit_count;
+        self.legacy_count -= candidate.legacy_count;
+
+        if problem.has_private_ancestors() {
+            let (weight, fee) = problem.private_ancestors(index);
+            self.private_weight -= weight;
+            self.private_fee -= fee;
+        }
+        if problem.has_shared_ancestors() {
+            for ancestor in problem.shared_drags_in(index).iter() {
+                self.shared_refcounts[ancestor] -= 1;
+                if self.shared_refcounts[ancestor] == 0 {
+                    let (weight, fee) = problem.ancestors()[ancestor];
+                    self.shared_weight -= weight;
+                    self.shared_fee -= fee;
+                }
+            }
+        }
+    }
+}
+
+/// A read-only view over a [`CoinSelector`] with cached aggregate queries.
+///
+/// Branch and bound maintains the cache incrementally. For ad-hoc use,
+/// [`CoinSelector::compute_view`] builds it from the current selection.
+#[derive(Clone, Debug)]
+pub struct SelectionView<'a> {
+    selector: &'a CoinSelector<'a>,
+    cache: Cow<'a, SelectionCache>,
+}
+
+impl<'a> Deref for SelectionView<'a> {
+    type Target = CoinSelector<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.selector
+    }
+}
+
+impl<'a> SelectionView<'a> {
+    pub(crate) fn with_cache(selector: &'a CoinSelector<'a>, cache: &'a SelectionCache) -> Self {
+        Self {
+            selector,
+            cache: Cow::Borrowed(cache),
+        }
+    }
+
+    pub(crate) fn from_selector(selector: &'a CoinSelector<'a>) -> Self {
+        Self {
+            selector,
+            cache: Cow::Owned(SelectionCache::from_selector(selector)),
+        }
+    }
+
+    /// The selector represented by this view.
+    pub fn selector(&self) -> &'a CoinSelector<'a> {
+        self.selector
+    }
+
+    /// Apply a hypothetical selection to this view's cached aggregates.
+    pub fn add(&mut self, index: usize) {
+        let candidate = self.selector.candidate(index);
+        self.cache
+            .to_mut()
+            .add(self.selector.problem(), index, candidate);
+    }
+
+    /// Apply a hypothetical deselection to this view's cached aggregates.
+    pub fn sub(&mut self, index: usize) {
+        let candidate = self.selector.candidate(index);
+        self.cache
+            .to_mut()
+            .sub(self.selector.problem(), index, candidate);
+    }
+
+    /// Absolute value sum of selected inputs.
+    pub fn selected_value(&self) -> u64 {
+        self.cache.value_sum
+    }
+
+    /// Input weight including the input-count varint and witness serialization overhead.
+    pub fn input_weight(&self) -> u64 {
+        self.cache.input_weight()
+    }
+
+    /// Current child transaction weight.
+    pub fn weight(&self, target_outputs: TargetOutputs, drain_weights: DrainWeights) -> u64 {
+        TX_FIXED_FIELD_WEIGHT
+            + self.input_weight()
+            + target_outputs.output_weight_with_drain(drain_weights)
+    }
+
+    /// Ancestor fee bump owed by the current selection, with shared ancestors charged once.
+    pub fn ancestor_bump(&self) -> u64 {
+        let weight = self.cache.private_weight + self.cache.shared_weight;
+        let fee = self.cache.private_fee + self.cache.shared_fee;
+        self.target()
+            .fee
+            .rate
+            .implied_fee_wu(weight)
+            .saturating_sub(fee)
+    }
+
+    /// Lower bound on the ancestor bump owed by this branch or any descendant.
+    pub fn ancestor_bump_lower_bound(&self) -> u64 {
+        let problem = self.selector.problem();
+        if !problem.has_ancestors() {
+            return 0;
+        }
+
+        let spwu = self.target().fee.rate.spwu() as f64;
+        let owes = |(weight, fee): (u64, u64)| weight as f64 * spwu - fee as f64;
+        let mut owed = 0.0;
+        let mut shed = 0.0;
+
+        if problem.has_private_ancestors() {
+            for index in self.cache.selected.iter() {
+                owed += owes(problem.private_ancestors(index));
+            }
+            for (index, _) in self.selector.candidates() {
+                if !self.cache.selected.contains(index) && !self.selector.banned().contains(index) {
+                    shed += (-owes(problem.private_ancestors(index))).max(0.0);
+                }
+            }
+        }
+
+        if problem.has_shared_ancestors() {
+            for (index, count) in self.cache.shared_refcounts.iter().enumerate() {
+                if *count > 0 {
+                    owed += owes(problem.ancestors()[index]);
+                }
+            }
+
+            let mut addable = Bitset::with_capacity(problem.ancestors().len());
+            for (index, _) in self.selector.candidates() {
+                if self.cache.selected.contains(index) || self.selector.banned().contains(index) {
+                    continue;
+                }
+                for ancestor in problem.shared_drags_in(index).iter() {
+                    if self.cache.shared_refcounts[ancestor] == 0 {
+                        addable.insert(ancestor);
+                    }
+                }
+            }
+            for ancestor in addable.iter() {
+                shed += (-owes(problem.ancestors()[ancestor])).max(0.0);
+            }
+        }
+
+        let bound = owed - shed;
+        if bound <= 0.0 {
+            0
+        } else {
+            bound as u64
+        }
+    }
+
+    fn implied_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {
+        self.target()
+            .fee
+            .rate
+            .implied_fee(self.weight(self.target().outputs, drain_weights))
+            + self.ancestor_bump()
+    }
+
+    fn implied_fee_from_feerate_wu(&self, drain_weights: DrainWeights) -> u64 {
+        self.target()
+            .fee
+            .rate
+            .implied_fee_wu(self.weight(self.target().outputs, drain_weights))
+            + self.ancestor_bump()
+    }
+
+    /// Excess against all target fee constraints.
+    pub fn excess(&self, drain: Drain) -> i64 {
+        self.rate_excess(drain)
+            .min(self.absolute_excess(drain))
+            .min(self.replacement_excess(drain))
+    }
+
+    /// Excess against the target feerate, including ancestor bumping.
+    pub fn rate_excess(&self, drain: Drain) -> i64 {
+        self.selected_value() as i64
+            - self.target().value() as i64
+            - drain.value as i64
+            - self.implied_fee_from_feerate(drain.weights) as i64
+    }
+
+    /// Weight-unit version of [`rate_excess`](Self::rate_excess).
+    pub fn rate_excess_wu(&self, drain: Drain) -> i64 {
+        self.selected_value() as i64
+            - self.target().value() as i64
+            - drain.value as i64
+            - self.implied_fee_from_feerate_wu(drain.weights) as i64
+    }
+
+    /// Excess against the absolute fee target.
+    pub fn absolute_excess(&self, drain: Drain) -> i64 {
+        self.selected_value() as i64
+            - self.target().value() as i64
+            - drain.value as i64
+            - self.target().fee.absolute as i64
+    }
+
+    /// Excess against replacement rule 4.
+    pub fn replacement_excess(&self, drain: Drain) -> i64 {
+        let fee = self.target().fee.replace.map_or(0, |replace| {
+            replace.min_fee_to_do_replacement(self.weight(self.target().outputs, drain.weights))
+        });
+        self.selected_value() as i64
+            - self.target().value() as i64
+            - drain.value as i64
+            - fee as i64
+    }
+
+    /// Weight-unit version of [`replacement_excess`](Self::replacement_excess).
+    pub fn replacement_excess_wu(&self, drain: Drain) -> i64 {
+        let fee = self.target().fee.replace.map_or(0, |replace| {
+            replace.min_fee_to_do_replacement_wu(self.weight(self.target().outputs, drain.weights))
+        });
+        self.selected_value() as i64
+            - self.target().value() as i64
+            - drain.value as i64
+            - fee as i64
+    }
+
+    /// Whether the value and fee target is met with `drain`.
+    pub fn is_funded_with_drain(&self, drain: Drain) -> bool {
+        self.excess(drain) >= 0
+    }
+
+    /// Whether the value and fee target is met without change.
+    pub fn is_funded(&self) -> bool {
+        self.is_funded_with_drain(Drain::NONE)
+    }
+
+    /// Whether selecting every remaining effective candidate can meet the target.
+    ///
+    /// As on [`CoinSelector::is_fundable`], this is a heuristic when ancestors are present.
+    pub fn is_fundable(&self) -> bool {
+        let mut local = self.clone();
+        for (index, candidate) in self.selector.unselected() {
+            if candidate.effective_value(self.target().fee.rate) > 0.0 {
+                local.add(index);
+            }
+        }
+        local.is_funded()
+    }
+
+    /// Additional value needed to meet the target.
+    pub fn missing(&self) -> u64 {
+        let excess = self.excess(Drain::NONE);
+        if excess < 0 {
+            excess.unsigned_abs()
+        } else {
+            0
+        }
+    }
+
+    /// Whether this child transaction fits its target weight cap.
+    pub fn is_within_max_weight(&self, drain_weights: DrainWeights) -> bool {
+        self.target().max_weight.map_or(true, |max_weight| {
+            self.weight(self.target().outputs, drain_weights) <= max_weight
+        })
+    }
+
+    /// Actual child fee for the supplied output values.
+    pub fn fee(&self, target_value: u64, drain_value: u64) -> i64 {
+        self.selected_value() as i64 - target_value as i64 - drain_value as i64
+    }
+
+    /// Fee required by all target fee constraints for this selection.
+    pub fn implied_fee(&self, drain_weights: DrainWeights) -> u64 {
+        let mut fee = self
+            .implied_fee_from_feerate(drain_weights)
+            .max(self.target().fee.absolute);
+        if let Some(replace) = self.target().fee.replace {
+            fee = fee.max(
+                replace
+                    .min_fee_to_do_replacement(self.weight(self.target().outputs, drain_weights)),
+            );
+        }
+        fee
+    }
+
+    /// Child transaction feerate implied by the selection and outputs.
+    pub fn implied_feerate(&self, target_outputs: TargetOutputs, drain: Drain) -> Option<FeeRate> {
+        let fee =
+            self.selected_value() as i64 - target_outputs.value_sum as i64 - drain.value as i64;
+        let weight = self.weight(target_outputs, drain.weights);
+        if fee < 0 || weight == 0 {
+            return None;
+        }
+        Some(FeeRate::from_sat_per_wu(fee as f32 / weight as f32))
+    }
+
+    /// A lower bound on the child fee for this branch and every descendant.
+    pub(crate) fn fee_floor(&self) -> u64 {
+        let weight = self.weight(self.target().outputs, DrainWeights::NONE);
+        let mut floor = (self.target().fee.rate.implied_fee_wu(weight)
+            + self.ancestor_bump_lower_bound())
+        .max(self.target().fee.absolute);
+        if let Some(replace) = self.target().fee.replace {
+            floor = floor.max(replace.min_fee_to_do_replacement_wu(weight));
+        }
+        floor
+    }
+
+    /// The value of a policy-controlled change output, if one should be added.
+    pub fn drain_value(&self, change_policy: ChangePolicy) -> Option<u64> {
+        let excess = self.excess(Drain {
+            weights: change_policy.drain_weights,
+            value: 0,
+        });
+        if excess > change_policy.min_value as i64 {
+            Some(excess as u64)
+        } else {
+            None
+        }
+    }
+
+    /// A policy-controlled change output.
+    pub fn drain(&self, change_policy: ChangePolicy) -> Drain {
+        self.drain_value(change_policy)
+            .map_or(Drain::NONE, |value| Drain {
+                weights: change_policy.drain_weights,
+                value,
+            })
+    }
+
+    /// The current selection's effective value at `feerate`.
+    pub fn effective_value(&self, feerate: FeeRate) -> i64 {
+        self.selected_value() as i64 - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
+    }
+
+    /// Waste created by this selection.
+    pub fn waste(&self, long_term_feerate: FeeRate, drain: Drain, excess_discount: f32) -> f32 {
+        debug_assert!((0.0..=1.0).contains(&excess_discount));
+        let mut waste =
+            self.input_weight() as f32 * (self.target().fee.rate.spwu() - long_term_feerate.spwu());
+        if drain.is_none() {
+            waste += self.excess(drain).max(0) as f32 * excess_discount.clamp(0.0, 1.0);
+        } else {
+            waste += drain.weights.waste(
+                self.target().fee.rate,
+                long_term_feerate,
+                self.target().outputs.n_outputs,
+            );
+        }
+        waste
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AncestorToBump, Input, Target, TargetFee, TargetOutputs};
+
+    fn target() -> Target {
+        Target {
+            fee: TargetFee::ZERO,
+            outputs: TargetOutputs {
+                value_sum: 0,
+                weight_sum: 0,
+                n_outputs: 0,
+            },
+            max_weight: None,
+        }
+    }
+
+    #[test]
+    fn mixed_candidate_counts_match_selector() {
+        let candidates = [
+            Candidate {
+                value: 1,
+                weight: 200,
+                segwit_count: 1,
+                legacy_count: 2,
+            },
+            Candidate::new_legacy(2, 100),
+        ];
+        let problem = SelectionProblem::new_no_ancestors(target(), candidates);
+        let mut selector = problem.selector();
+        selector.select_all();
+        let view = selector.compute_view();
+        assert_eq!(view.input_weight(), selector.input_weight());
+        assert_eq!(view.selected_value(), selector.selected_value());
+    }
+
+    #[test]
+    fn shared_ancestor_is_cached_once_and_removed_on_last_sub() {
+        let ancestors = [AncestorToBump {
+            txid: 1,
+            weight: 400,
+            fee: 0,
+            parents: alloc::vec![],
+        }];
+        let inputs = [
+            Input {
+                value: 1_000,
+                weight: 100,
+                is_segwit: true,
+                residing_txid: 1,
+            },
+            Input {
+                value: 2_000,
+                weight: 100,
+                is_segwit: false,
+                residing_txid: 1,
+            },
+        ];
+        let problem = SelectionProblem::new(target(), inputs, ancestors);
+        let selector = problem.selector();
+        let mut view = selector.compute_view();
+        view.add(0);
+        let once = view.ancestor_bump();
+        view.add(1);
+        assert_eq!(view.ancestor_bump(), once);
+        view.sub(0);
+        assert_eq!(view.ancestor_bump(), once);
+        view.sub(1);
+        assert_eq!(view.ancestor_bump(), 0);
+    }
+
+    #[test]
+    fn cache_matches_selector_for_every_mixed_selection() {
+        let candidates = [
+            Candidate::new_segwit(1_000, 100),
+            Candidate::new_legacy(2_000, 200),
+            Candidate {
+                value: 3_000,
+                weight: 350,
+                segwit_count: 2,
+                legacy_count: 3,
+            },
+        ];
+        let problem = SelectionProblem::new_no_ancestors(target(), candidates);
+        for mask in 0..1 << candidates.len() {
+            let mut selector = problem.selector();
+            for index in 0..candidates.len() {
+                if mask & (1 << index) != 0 {
+                    selector.select(index);
+                }
+            }
+            let view = selector.compute_view();
+            assert_eq!(view.selected_value(), selector.selected_value());
+            assert_eq!(view.input_weight(), selector.input_weight());
+            assert_eq!(view.excess(Drain::NONE), selector.excess(Drain::NONE));
+        }
+    }
+
+    #[test]
+    fn hypothetical_ancestor_queries_match_selector_mutations() {
+        let mut target = target();
+        target.fee = TargetFee::from_feerate(FeeRate::from_sat_per_vb(4.0));
+        let ancestors = [
+            AncestorToBump {
+                txid: 1,
+                weight: 400,
+                fee: 0,
+                parents: alloc::vec![],
+            },
+            AncestorToBump {
+                txid: 2,
+                weight: 400,
+                fee: 800,
+                parents: alloc::vec![],
+            },
+        ];
+        let groups = [
+            alloc::vec![
+                Input {
+                    value: 1_000,
+                    weight: 100,
+                    is_segwit: true,
+                    residing_txid: 1,
+                },
+                Input {
+                    value: 1_000,
+                    weight: 100,
+                    is_segwit: false,
+                    residing_txid: 2,
+                },
+            ],
+            alloc::vec![Input {
+                value: 2_000,
+                weight: 100,
+                is_segwit: true,
+                residing_txid: 1,
+            }],
+        ];
+        let problem = SelectionProblem::new(target, groups, ancestors);
+        let base = problem.selector();
+        let mut actual = base.clone();
+        let mut hypothetical = base.compute_view();
+
+        for index in 0..2 {
+            actual.select(index);
+            hypothetical.add(index);
+            assert_eq!(hypothetical.ancestor_bump(), actual.ancestor_bump());
+            assert_eq!(
+                hypothetical.ancestor_bump_lower_bound(),
+                actual.ancestor_bump_lower_bound()
+            );
+            assert_eq!(hypothetical.excess(Drain::NONE), actual.excess(Drain::NONE));
+        }
+
+        actual.deselect(0);
+        hypothetical.sub(0);
+        assert_eq!(hypothetical.ancestor_bump(), actual.ancestor_bump());
+        assert_eq!(
+            hypothetical.ancestor_bump_lower_bound(),
+            actual.ancestor_bump_lower_bound()
+        );
+    }
+}

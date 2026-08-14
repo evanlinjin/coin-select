@@ -279,7 +279,7 @@ fn does_not_create_change_below_spend_cost() {
     expected.select(0);
     assert_eq!(cs.selected_indices(), expected.selected_indices());
     assert!(
-        metric.drain(&cs).is_none(),
+        metric.drain(&cs.compute_view()).is_none(),
         "optimal selection must be changeless"
     );
 
@@ -289,7 +289,12 @@ fn does_not_create_change_below_spend_cost() {
         with_extra_input.select(2);
         with_extra_input
     };
-    assert!(score <= metric.score(&with_extra_input).expect("target is met"));
+    assert!(
+        score
+            <= metric
+                .score(&with_extra_input.compute_view())
+                .expect("target is met")
+    );
 }
 
 #[test]

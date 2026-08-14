@@ -312,8 +312,8 @@ fn score_is_the_childs_fee_which_already_covers_the_bump() {
     cs.select(0);
 
     let mut m = metric();
-    let score = m.score(&cs).expect("funded");
-    let drain = m.drain(&cs);
+    let score = m.score(&cs.compute_view()).expect("funded");
+    let drain = m.drain(&cs.compute_view());
     assert_eq!(
         score,
         Ordf32(
@@ -368,7 +368,7 @@ fn changeless_solution_reachable_only_via_an_ancestor_is_not_pruned() {
     clean_only.select(0);
     assert!(clean_only.is_funded());
     assert!(
-        m.drain(&clean_only).is_some(),
+        m.drain(&clean_only.compute_view()).is_some(),
         "the clean coin on its own overshoots enough to warrant change"
     );
 
@@ -378,7 +378,7 @@ fn changeless_solution_reachable_only_via_an_ancestor_is_not_pruned() {
     assert_eq!(both.ancestor_bump(), 10_800);
     assert!(both.is_funded(), "still funded after paying the bump");
     assert!(
-        m.drain(&both).is_none(),
+        m.drain(&both.compute_view()).is_none(),
         "the bump leaves too little excess to be worth a change output"
     );
 
@@ -507,7 +507,9 @@ fn bound_credits_the_bump_when_nothing_overpays() {
         .fee
         .rate
         .implied_fee_wu(cs.weight(t.outputs, DrainWeights::NONE));
-    let bound = metric().bound(&cs).expect("within max_weight");
+    let bound = metric()
+        .bound(&cs.compute_view())
+        .expect("within max_weight");
     assert!(
         bound >= Ordf32((child_fee + 2_500) as f32),
         "bound {} must charge the child's own fee ({}) plus the 2_500 bump",
@@ -587,8 +589,8 @@ fn funded_bound_gives_up_reachable_surplus() {
     assert_eq!(cs.ancestor_bump(), 1_000);
     assert_eq!(cs.ancestor_bump_lower_bound(), 0);
 
-    let score = metric().score(&cs).unwrap();
-    let bound = metric().bound(&cs).unwrap();
+    let score = metric().score(&cs.compute_view()).unwrap();
+    let bound = metric().bound(&cs.compute_view()).unwrap();
     assert!(
         bound <= Ordf32(score.0 - 1_000.0),
         "bound {} must sit at least the 1_000 surplus below score {}",
@@ -598,7 +600,7 @@ fn funded_bound_gives_up_reachable_surplus() {
 
     let mut both = cs.clone();
     both.select(1);
-    let both_score = metric().score(&both).unwrap();
+    let both_score = metric().score(&both.compute_view()).unwrap();
     assert!(
         bound <= both_score,
         "bound {} above descendant score {}",
@@ -655,11 +657,11 @@ fn funded_bound_subtracts_surplus_before_float_conversion() {
     node.select(0);
     assert_eq!(node.ancestor_bump(), 1_998_000_000);
     assert_eq!(node.ancestor_bump_lower_bound(), 0);
-    let bound = metric.bound(&node).unwrap();
+    let bound = metric.bound(&node.compute_view()).unwrap();
 
     let mut descendant = node.clone();
     descendant.select(1);
-    let score = metric.score(&descendant).unwrap();
+    let score = metric.score(&descendant.compute_view()).unwrap();
     assert_eq!(score, Ordf32(700_000.0));
     assert!(bound <= score, "bound {} above descendant {}", bound, score);
 }
@@ -677,7 +679,7 @@ fn unfunded_bound_does_not_claim_infeasibility() {
     let cs = problem.selector();
     assert!(!cs.is_funded());
     assert!(
-        metric().bound(&cs).is_some(),
+        metric().bound(&cs.compute_view()).is_some(),
         "an unfunded root with a live funded subset must not be pruned"
     );
 }
@@ -700,10 +702,10 @@ fn unfunded_bound_credits_selected_package_surplus() {
     node.select(0);
     assert!(!node.is_funded());
 
-    let bound = metric().bound(&node).unwrap();
+    let bound = metric().bound(&node.compute_view()).unwrap();
     let mut descendant = node.clone();
     descendant.select(1);
-    let score = metric().score(&descendant).unwrap();
+    let score = metric().score(&descendant.compute_view()).unwrap();
     assert!(
         bound <= score,
         "bound {} above package-subsidized descendant {}",
@@ -722,10 +724,10 @@ fn unfunded_bound_does_not_double_count_absolute_fee() {
         SelectionProblem::new(t, [input(105_000, "P")], [ancestor("P", 4_000, 0, vec![])]);
 
     let root = problem.selector();
-    let bound = metric().bound(&root).unwrap();
+    let bound = metric().bound(&root.compute_view()).unwrap();
     let mut descendant = root.clone();
     descendant.select(0);
-    let score = metric().score(&descendant).unwrap();
+    let score = metric().score(&descendant.compute_view()).unwrap();
     assert_eq!(score, Ordf32(5_000.0));
     assert!(bound <= score, "bound {} above descendant {}", bound, score);
 }
@@ -743,10 +745,10 @@ fn unfunded_bound_does_not_double_count_rbf_fee() {
         SelectionProblem::new(t, [input(105_104, "P")], [ancestor("P", 4_000, 0, vec![])]);
 
     let root = problem.selector();
-    let bound = metric().bound(&root).unwrap();
+    let bound = metric().bound(&root.compute_view()).unwrap();
     let mut descendant = root.clone();
     descendant.select(0);
-    let score = metric().score(&descendant).unwrap();
+    let score = metric().score(&descendant.compute_view()).unwrap();
     assert_eq!(score, Ordf32(5_104.0));
     assert!(bound <= score, "bound {} above descendant {}", bound, score);
 }
@@ -1001,7 +1003,7 @@ proptest! {
         );
 
         for node in nodes {
-            let bound = metric.bound(&node);
+            let bound = metric.bound(&node.compute_view());
             let subtree = std::iter::once(node.clone()).chain(
                 common::ExhaustiveIter::new(&node)
                     .into_iter()
@@ -1011,7 +1013,7 @@ proptest! {
             );
 
             for descendant in subtree {
-                let score = metric.score(&descendant);
+                let score = metric.score(&descendant.compute_view());
                 match bound {
                     Some(lb) => if let Some(score) = score {
                         prop_assert!(

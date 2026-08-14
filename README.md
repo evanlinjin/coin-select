@@ -136,6 +136,10 @@ let target = Target {
 let problem = SelectionProblem::new_no_ancestors(target, candidates);
 let mut coin_selector = CoinSelector::new(&problem);
 
+// For repeated read-only calculations, compute a cached view of the current selection.
+let empty_view = coin_selector.compute_view();
+assert_eq!(empty_view.selected_value(), 0);
+
 // The feerate used to work out whether a change output would be dust (and so shouldn't be added).
 // The standard dust relay feerate is 3 sat/vb.
 let dust_relay_feerate = FeeRate::from_sat_per_vb(3.0);
@@ -157,7 +161,7 @@ let change = match coin_selector.run_bnb(metric, 100_000) {
         // fall back to naive selection
         coin_selector.select_until_target_met().expect("a selection was impossible!");
         // the metric still decides the change output for whatever we end up selecting
-        metric.drain(&coin_selector)
+        metric.drain(&coin_selector.compute_view())
     }
     Ok((score, change)) => {
         println!("we found a solution with score {}", score);
@@ -179,4 +183,3 @@ println!("We are including a change output of {} value (0 means not change)", ch
 # Minimum Supported Rust Version (MSRV)
 
 This library is compiles on rust v1.54 and above
-
