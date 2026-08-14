@@ -26,6 +26,12 @@ pub(crate) struct SelectionCache {
     shared_reachable_refcounts: Vec<u32>,
     shared_reachable_surplus: f64,
     ancestor_fee_precision_slack: u64,
+    /// Value and weight of the still-undecided candidates worth selecting, i.e. those neither
+    /// selected nor banned whose standalone effective value is positive. Candidates that cost more
+    /// weight than they bring are left out because they only ever lower the total, so the pair
+    /// stays an upper bound on what the rest of this branch can still contribute.
+    undecided_value: u64,
+    undecided_weight: u64,
     selected: Bitset,
 }
 
@@ -59,23 +65,23 @@ impl SelectionCache {
             ],
             shared_reachable_surplus: 0.0,
             ancestor_fee_precision_slack: selector.problem().ancestor_fee_precision_slack(),
+            undecided_value: 0,
+            undecided_weight: 0,
             // BnB transitions each candidate exactly once, so it needs no duplicate-tracking
             // bitset. Public hypothetical updates allocate this lazily in `track_selected`.
             selected: Bitset::default(),
         };
-        if selector.problem().has_ancestors() {
-            for (index, _) in selector.candidates() {
-                cache.add_reachable(selector.problem(), index);
-            }
+        // Every candidate starts undecided and reachable; the two loops below then account for the
+        // ones that are already selected or already banned.
+        for (index, _) in selector.candidates() {
+            cache.add_reachable(selector.problem(), index);
         }
         for (index, candidate) in selector.selected() {
             cache.add(selector.problem(), index, candidate, true);
         }
-        if selector.problem().has_ancestors() {
-            for index in selector.banned().iter() {
-                if !selector.is_selected(index) {
-                    cache.ban(selector.problem(), index);
-                }
+        for index in selector.banned().iter() {
+            if !selector.is_selected(index) {
+                cache.ban(selector.problem(), index);
             }
         }
         cache
@@ -85,7 +91,22 @@ impl SelectionCache {
         (fee as f64 - weight as f64 * problem.target().fee.rate.spwu() as f64).max(0.0)
     }
 
+    /// Whether this candidate brings in more value than its own weight costs at the target
+    /// feerate. One that doesn't can only ever lower a running total, so the undecided aggregate
+    /// leaves it out and stays an upper bound.
+    fn is_worth_selecting(problem: &SelectionProblem, index: usize) -> bool {
+        problem
+            .candidate(index)
+            .effective_value(problem.target().fee.rate)
+            > 0.0
+    }
+
     fn add_reachable(&mut self, problem: &SelectionProblem, index: usize) {
+        if Self::is_worth_selecting(problem, index) {
+            let candidate = problem.candidate(index);
+            self.undecided_value += candidate.value;
+            self.undecided_weight += candidate.weight;
+        }
         if !problem.has_ancestors() {
             return;
         }
@@ -107,6 +128,11 @@ impl SelectionCache {
     }
 
     fn remove_reachable(&mut self, problem: &SelectionProblem, index: usize) {
+        if Self::is_worth_selecting(problem, index) {
+            let candidate = problem.candidate(index);
+            self.undecided_value -= candidate.value;
+            self.undecided_weight -= candidate.weight;
+        }
         if !problem.has_ancestors() {
             return;
         }
@@ -369,6 +395,30 @@ impl<'a> SelectionView<'a> {
         } else {
             (bound as u64).saturating_sub(self.cache.ancestor_fee_precision_slack)
         }
+    }
+
+    /// The most any descendant of this branch could still improve the feerate constraint.
+    ///
+    /// This is Bitcoin Core's `SelectCoinsBnB` lookahead (`curr_available_value`): the search keeps
+    /// a running total of what the undecided candidates can contribute, and a node whose total
+    /// still cannot close the gap has an empty subtree. Constant-time against the cache.
+    ///
+    /// Both terms are one-sided, so the result is an over-estimate and never prunes a branch that
+    /// holds a solution. The undecided pair counts only candidates worth selecting, and the current
+    /// ancestor bump is swapped for [`ancestor_bump_lower_bound`](Self::ancestor_bump_lower_bound),
+    /// which holds for this branch and every descendant — so a subsidizing ancestor that a
+    /// descendant might drag in is credited here rather than assumed away. The input-count varint
+    /// and witness overhead those candidates would add is ignored for the same reason: leaving it
+    /// out can only make this larger.
+    pub(crate) fn best_reachable_rate_excess_wu(&self) -> i64 {
+        self.rate_excess_wu(Drain::NONE) + self.ancestor_bump() as i64
+            - self.ancestor_bump_lower_bound() as i64
+            + self.cache.undecided_value as i64
+            - self
+                .target()
+                .fee
+                .rate
+                .implied_fee_wu(self.cache.undecided_weight) as i64
     }
 
     fn implied_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {

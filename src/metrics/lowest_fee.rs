@@ -29,9 +29,11 @@ use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionVie
 /// The bound uses a child-weight relaxation when ancestors are present (see
 /// [`bound`](BnbMetric::bound)): a funded node credits reachable ancestor surplus and possible future
 /// change, clamped to the monotone fee floor, while an unfunded one estimates the least child weight
-/// needed to meet each fee constraint. That relaxation may call a subtree empty only when the most
-/// optimistic input still available cannot close a deficit — never from "select everything and it is
-/// still unfunded", which does not follow while funding is not monotone.
+/// needed to meet each fee constraint. Neither reasons from "select everything and it is still
+/// unfunded", which does not follow while funding is not monotone. Infeasibility comes from the two
+/// prunes that can prove it: the lookahead in [`bound`](BnbMetric::bound), which relaxes the
+/// ancestor bump to its branch-wide floor rather than assuming it only grows, and the relaxation's
+/// own test for a deficit the most optimistic input still available cannot close at any weight.
 ///
 /// [`SelectionProblem`]: crate::SelectionProblem
 #[derive(Clone, Copy)]
@@ -270,8 +272,18 @@ impl BnbMetric for LowestFee {
             return None;
         }
 
-        // With unconfirmed ancestors, funding is not monotone. Use the child-weight relaxation in
-        // `bound_with_ancestors`; never claim the subtree is empty.
+        // Lookahead hard-prune (Bitcoin Core's `curr_available_value` test): if everything still
+        // undecided cannot close the feerate gap, no descendant is funded, so the subtree is empty.
+        // Funding needs every fee constraint met, so failing this one alone is enough to prune.
+        // Constant-time, and it fires before either relaxation below does any work.
+        if cs.best_reachable_rate_excess_wu() < 0 {
+            return None;
+        }
+
+        // With unconfirmed ancestors, funding is not monotone, so neither this path nor the one
+        // below may reason from "select everything and it is still unfunded". Emptiness is claimed
+        // only where it is provable: by the lookahead above, which relaxes the bump to its
+        // branch-wide floor, and by `bound_with_ancestors`' own unclosable-deficit test.
         if cs.problem().has_ancestors() {
             return self.bound_with_ancestors(cs);
         }
