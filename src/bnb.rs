@@ -41,6 +41,21 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
             return None;
         }
 
+        // {
+        //     println!("=========================== {:?}", self.best);
+        //     println!("{} {:?}", &self.selector, self.bound_of_current());
+        //     for frame in self.stack.iter() {
+        //         println!(
+        //             "\t{} [{}] cursor={} sibling_pending={}",
+        //             if frame.is_inclusion { "IN " } else { "EX " },
+        //             frame.index,
+        //             frame.cursor,
+        //             frame.sibling_pending,
+        //         );
+        //     }
+        //     let _ = std::io::stdin().read_line(&mut alloc::string::String::new());
+        // }
+
         let return_val = if !self.is_exclusion_node() {
             self.try_record_best()
                 .map(|score| (self.selector.clone(), score))
@@ -182,6 +197,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             {
                 break;
             }
+            // println!("banning: [{}] {:?}", next_index, next);
             banned.push(next_index);
             next_cursor += 1;
         }
@@ -264,6 +280,16 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         let exc_ok = self.is_promising(exc_bound);
         self.undo_exclude(&banned);
 
+        // println!(
+        //     "\t\t(DESC) branch={} next=[{}] inc_lb={:?}{} exc_lb={:?}{}",
+        //     self.selector,
+        //     index,
+        //     inc_bound,
+        //     if inc_ok { "" } else { " (REJ)" },
+        //     exc_bound,
+        //     if exc_ok { "" } else { " (REJ)" },
+        // );
+
         match (inc_ok, exc_ok) {
             (false, false) => false,
             (true, false) => {
@@ -292,6 +318,12 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
 
     fn backtrack_to_next_branch(&mut self) -> bool {
         while let Some(frame) = self.stack.pop() {
+            // println!(
+            //     "\t\t(BACK) undo {} [{}] sibling_pending={}",
+            //     if frame.is_inclusion { "IN " } else { "EX " },
+            //     frame.index,
+            //     frame.sibling_pending,
+            // );
             if frame.is_inclusion {
                 self.undo_include(frame.index);
                 if frame.sibling_pending {
