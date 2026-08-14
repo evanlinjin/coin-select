@@ -11,6 +11,9 @@ use alloc::collections::BinaryHeap;
 pub(crate) struct BnbIter<'a, M: BnbMetric> {
     queue: BinaryHeap<Branch<'a>>,
     best: Option<Ordf32>,
+    /// A greedy selection, yielded before the first pop so a caller that runs out of rounds still
+    /// gets an answer. See [`BnbIter::seed_greedy_incumbent`].
+    seed: Option<(CoinSelector<'a>, Ordf32)>,
     /// The `BnBMetric` that will score each selection
     pub(crate) metric: M,
 }
@@ -26,6 +29,10 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
         //     }
         //     let _ = std::io::stdin().read_line(&mut alloc::string::String::new());
         // }
+
+        if let Some(seed) = self.seed.take() {
+            return Some(Some(seed));
+        }
 
         let branch = self.queue.pop()?;
         if let Some(best) = &self.best {
@@ -84,6 +91,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         let mut iter = BnbIter {
             queue: BinaryHeap::default(),
             best: None,
+            seed: None,
             metric,
         };
 
@@ -91,10 +99,29 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             selector.sort_candidates_by_descending_value_pwu();
         }
 
+        iter.seed_greedy_incumbent(&selector);
+
         let cache = SelectionCache::from_selector(&selector);
         iter.consider_adding_to_queue(&selector, &cache, false, 0);
 
         iter
+    }
+
+    /// Score the greedy prefix and adopt it as the incumbent.
+    ///
+    /// The search is otherwise not anytime: on a large pool it can spend its whole round budget on
+    /// shallow branches and return nothing, leaving the caller to fall back on something far worse
+    /// than the selection a greedy pass would have handed it for free. Seeding costs one round and
+    /// one scored selection, and the bound stays admissible, so the optimum is still reachable.
+    fn seed_greedy_incumbent(&mut self, selector: &CoinSelector<'a>) {
+        let mut seed = selector.clone();
+        if seed.select_until_target_met().is_err() {
+            return;
+        }
+        if let Some(score) = self.metric.score(&seed.compute_view()) {
+            self.best = Some(score);
+            self.seed = Some((seed, score));
+        }
     }
 
     fn consider_adding_to_queue(

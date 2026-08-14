@@ -102,7 +102,7 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
         .last()
         .expect("it found a solution");
 
-    assert_eq!(rounds, 3194);
+    assert_eq!(rounds, 3195);
     assert_eq!(best.input_weight(), solution_weight);
     assert_eq!(best.selected_value(), target_value, "score={:?}", score);
 }
@@ -137,7 +137,7 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
         .last()
         .expect("found a solution");
 
-    assert_eq!(rounds, 164);
+    assert_eq!(rounds, 165);
     let excess = sol.excess(Drain::NONE);
     assert_eq!(excess, 0);
 }
