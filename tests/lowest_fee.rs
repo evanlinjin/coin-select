@@ -414,6 +414,25 @@ fn run_bnb_reports_max_weight_exceeded() {
     );
 }
 
+/// The search is seeded with the greedy selection, so a budget too small to search anything still
+/// comes back with a usable answer instead of `RoundLimit`. Without that, a caller on a large pool
+/// falls through to whatever fallback it has for something branch and bound could have covered.
+#[test]
+fn run_bnb_returns_the_greedy_selection_on_a_tight_budget() {
+    let candidates = core::iter::repeat(err_candidate(100_000))
+        .take(500)
+        .collect::<Vec<_>>();
+    let target = Target {
+        outputs: err_outputs(1_000_000),
+        fee: TargetFee::ZERO,
+        max_weight: None,
+    };
+    let problem_12 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs = CoinSelector::new(&problem_12);
+    cs.run_bnb(err_metric(), 1).expect("the seed is a solution");
+    assert!(cs.is_funded());
+}
+
 #[test]
 fn run_bnb_reports_round_limit() {
     // A solvable target, but zero rounds: we can't conclude infeasibility, only that we gave up.
