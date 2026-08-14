@@ -32,6 +32,10 @@ pub(crate) struct SelectionCache {
     /// stays an upper bound on what the rest of this branch can still contribute.
     undecided_value: u64,
     undecided_weight: u64,
+    /// How many of the undecided candidates were left out of the pair above. A pool with none of
+    /// them is one where adding a candidate can only raise the excess, which is what Bitcoin Core
+    /// gets by filtering its pool and asserting the result.
+    undecided_not_worth_selecting: usize,
     selected: Bitset,
 }
 
@@ -67,6 +71,7 @@ impl SelectionCache {
             ancestor_fee_precision_slack: selector.problem().ancestor_fee_precision_slack(),
             undecided_value: 0,
             undecided_weight: 0,
+            undecided_not_worth_selecting: 0,
             // BnB transitions each candidate exactly once, so it needs no duplicate-tracking
             // bitset. Public hypothetical updates allocate this lazily in `track_selected`.
             selected: Bitset::default(),
@@ -106,6 +111,8 @@ impl SelectionCache {
             let candidate = problem.candidate(index);
             self.undecided_value += candidate.value;
             self.undecided_weight += candidate.weight;
+        } else {
+            self.undecided_not_worth_selecting += 1;
         }
         if !problem.has_ancestors() {
             return;
@@ -132,6 +139,8 @@ impl SelectionCache {
             let candidate = problem.candidate(index);
             self.undecided_value -= candidate.value;
             self.undecided_weight -= candidate.weight;
+        } else {
+            self.undecided_not_worth_selecting -= 1;
         }
         if !problem.has_ancestors() {
             return;
@@ -415,6 +424,18 @@ impl<'a> SelectionView<'a> {
                 .fee
                 .rate
                 .implied_fee_wu(self.cache.undecided_weight) as i64
+    }
+
+    /// Whether some candidate is still undecided, and every one of them raises the excess when
+    /// selected.
+    ///
+    /// Bitcoin Core's `SelectCoinsBnB` gets this by construction — its caller filters the pool and
+    /// it asserts the result — which is what lets it cut a branch the moment the selection overshoots
+    /// its target range. We cannot assume it, because a candidate that costs more than it brings is
+    /// exactly what a changeless selection may need to burn excess down into range, so we check.
+    pub(crate) fn every_undecided_candidate_is_worth_selecting(&self) -> bool {
+        self.cache.undecided_not_worth_selecting == 0
+            && (self.cache.undecided_value > 0 || self.cache.undecided_weight > 0)
     }
 
     fn implied_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {

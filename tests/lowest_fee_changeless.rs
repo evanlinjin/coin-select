@@ -45,6 +45,83 @@ fn funded_changeful_branch_is_bounded_by_its_no_change_fee() {
     assert_eq!(metric.bound(&view), Some(Ordf32(10_000.0)));
 }
 
+/// A candidate that costs more than it brings is exactly what this metric may need: it burns excess
+/// down into the changeless window. Here `{c1}` alone overshoots and wants change, and only adding
+/// the negative-effective-value `c0` lands the pair inside the window. So the search must not filter
+/// such candidates out the way Bitcoin Core's does, and the window cut must not assume every
+/// remaining candidate raises the excess. Minimised out of `changeless_bnb_finds_the_brute_force_optimum`.
+#[test]
+fn a_candidate_not_worth_selecting_can_still_be_needed() {
+    let target = Target {
+        outputs: TargetOutputs {
+            n_outputs: 1,
+            value_sum: 33_719,
+            weight_sum: 100,
+        },
+        fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(9.715925)),
+        max_weight: None,
+    };
+    let candidates = [
+        Candidate {
+            value: 1_000,
+            weight: 611,
+            segwit_count: 1,
+            legacy_count: 0,
+        },
+        Candidate {
+            value: 35_977,
+            weight: 372,
+            segwit_count: 1,
+            legacy_count: 0,
+        },
+    ];
+    assert!(
+        candidates[0].effective_value(target.fee.rate) < 0.0,
+        "c0 is the candidate a Core-style pool filter would drop"
+    );
+
+    let problem = SelectionProblem::new_no_ancestors(target, candidates);
+    let mut selector = problem.selector();
+    let metric = LowestFeeChangeless {
+        long_term_feerate: FeeRate::from_sat_per_vb(1.0),
+        dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
+        drain_weights: DrainWeights::TR_KEYSPEND,
+    };
+
+    // Brute force over all four subsets, scored with the metric itself.
+    let mut brute_force = None;
+    for subset in 0..1u32 << candidates.len() {
+        let mut cs = problem.selector();
+        for i in 0..candidates.len() {
+            if subset >> i & 1 == 1 {
+                cs.select(i);
+            }
+        }
+        if let Some(score) = metric.clone().score(&cs.compute_view()) {
+            let indices = cs.selected_indices().iter().collect::<Vec<_>>();
+            if brute_force.as_ref().map_or(true, |(best, _)| score < *best) {
+                brute_force = Some((score, indices));
+            }
+        }
+    }
+    let (expected_score, expected_indices) =
+        brute_force.expect("some subset is changeless and funded");
+    assert_eq!(
+        expected_indices,
+        [0, 1],
+        "the optimum is the one that needs c0"
+    );
+
+    let (score, _) = selector
+        .run_bnb(metric, 100)
+        .expect("the optimum needs the candidate that is not worth selecting");
+    assert_eq!(score, expected_score);
+    assert_eq!(
+        selector.selected_indices().iter().collect::<Vec<_>>(),
+        expected_indices
+    );
+}
+
 #[test]
 fn mixed_serialization_overhead_does_not_prune_exact_solution() {
     let target = Target {
