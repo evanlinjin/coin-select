@@ -13,10 +13,10 @@ use super::LowestFee;
 /// Unlike constraining an arbitrary metric after the fact, this metric has a changeless-specific
 /// lower bound. A changeless selection's score is its selected value minus the target value. Since
 /// selected value can only increase down a branch, the current no-change fee is a lower bound for
-/// every descendant, including when unconfirmed ancestry makes funding non-monotone. For pools of at
-/// most 24 candidates, the bound combines that fact with [`LowestFee`]'s funding relaxation. Larger
-/// pools retain only the `LowestFee` bound and ordering because the selected-value bound can starve
-/// useful branches under a finite round limit.
+/// every descendant, including when unconfirmed ancestry makes funding non-monotone. The bound
+/// combines that fact with [`LowestFee`]'s funding relaxation, at every pool size: the depth-first
+/// search visits a branch's own descendants before its siblings, so a bound that grows with the
+/// selection cuts the branch instead of merely reordering the frontier away from it.
 #[derive(Clone, Copy, Debug)]
 pub struct LowestFeeChangeless {
     /// The estimated feerate needed to spend a potential change output later.
@@ -68,9 +68,6 @@ impl BnbMetric for LowestFeeChangeless {
     fn bound(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         let mut lowest_fee = self.lowest_fee();
         let funding_bound = lowest_fee.bound(cs)?;
-        if cs.problem().len() > 24 {
-            return Some(funding_bound);
-        }
         let no_change_fee = Ordf32(cs.selected_value().saturating_sub(cs.target().value()) as f32);
         Some(funding_bound.max(no_change_fee))
     }
