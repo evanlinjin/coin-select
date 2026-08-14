@@ -9,7 +9,7 @@
 
 ```rust
 use std::str::FromStr;
-use bdk_coin_select::{ CoinSelector, Candidate, TR_KEYSPEND_TXIN_WEIGHT, Drain, FeeRate, Target, ChangePolicy, TargetOutputs, TargetFee, DrainWeights};
+use bdk_coin_select::{ CoinSelector, Candidate, SelectionProblem, TR_KEYSPEND_TXIN_WEIGHT, Drain, FeeRate, Target, ChangePolicy, TargetOutputs, TargetFee, DrainWeights};
 use bitcoin::{ Amount, Address, Network, Transaction, TxIn, TxOut };
 
 let recipient_addr: Address = "tb1pvjf9t34fznr53u5tqhejz4nr69luzkhlvsdsdfq9pglutrpve2xq7hps46"
@@ -53,7 +53,8 @@ let candidates = vec![
 ];
 
 // You can now select coins!
-let mut coin_selector = CoinSelector::new(&candidates, target);
+let problem = SelectionProblem::new_no_ancestors(target, candidates);
+let mut coin_selector = CoinSelector::new(&problem);
 coin_selector.select(0);
 
 assert!(!coin_selector.is_funded(), "we didn't select enough");
@@ -88,7 +89,7 @@ metric by implementing the [`BnbMetric`] yourself but we don't recommend this.
 
 ```rust
 use std::str::FromStr;
-use bdk_coin_select::{ BnbMetric, Candidate, CoinSelector, FeeRate, Target, TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT};
+use bdk_coin_select::{ BnbMetric, Candidate, CoinSelector, FeeRate, SelectionProblem, Target, TargetFee, TargetOutputs, TR_KEYSPEND_TXIN_WEIGHT};
 use bdk_coin_select::metrics::LowestFee;
 use bitcoin::{ Address, Amount, Network, Transaction, TxIn, TxOut };
 
@@ -132,7 +133,8 @@ let target = Target {
     max_weight: None,
 };
 
-let mut coin_selector = CoinSelector::new(&candidates, target);
+let problem = SelectionProblem::new_no_ancestors(target, candidates);
+let mut coin_selector = CoinSelector::new(&problem);
 
 // The feerate used to work out whether a change output would be dust (and so shouldn't be added).
 // The standard dust relay feerate is 3 sat/vb.

@@ -3,14 +3,12 @@ mod common;
 use bdk_coin_select::metrics::{Changeless, LowestFee};
 use bdk_coin_select::{
     BnbMetric, Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, FeeRate, NoBnbSolution,
-    Replace, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
+    Replace, SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
 };
 use proptest::prelude::*;
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        ..Default::default()
-    })]
+    #![proptest_config(ProptestConfig::default())]
 
     #[test]
     #[cfg(not(debug_assertions))] // too slow if compiling for debug
@@ -90,7 +88,8 @@ proptest! {
             params.n_candidates
         ];
 
-        let mut cs = CoinSelector::new(&candidates, params.target());
+        let problem = SelectionProblem::new_no_ancestors(params.target(), candidates.iter().copied());
+        let mut cs = CoinSelector::new(&problem);
 
         let metric = params.lowest_fee_metric();
         let is_impossible = !cs.is_fundable();
@@ -161,9 +160,11 @@ proptest! {
         let target = params.target();
         let metric = params.lowest_fee_metric();
 
-        let exact_possible = common::exact_selection_possible(&CoinSelector::new(&candidates, target));
+        let problem_2 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let exact_possible = common::exact_selection_possible(&CoinSelector::new(&problem_2));
 
-        let mut cs = CoinSelector::new(&candidates, target);
+        let problem_3 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+        let mut cs = CoinSelector::new(&problem_3);
         let bnb_found = common::bnb_search(&mut cs, metric, usize::MAX).is_ok();
         prop_assert_eq!(
             bnb_found, exact_possible,
@@ -195,8 +196,10 @@ fn combined_changeless_metric() {
 
     let candidates = common::gen_candidates(params.n_candidates);
     let target = params.target();
-    let mut cs_a = CoinSelector::new(&candidates, target);
-    let mut cs_b = CoinSelector::new(&candidates, target);
+    let problem_4 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs_a = CoinSelector::new(&problem_4);
+    let problem_5 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs_b = CoinSelector::new(&problem_5);
     let metric_lowest_fee = params.lowest_fee_metric();
 
     let metric_changeless = Changeless(params.lowest_fee_metric());
@@ -231,7 +234,7 @@ fn does_not_create_change_below_spend_cost() {
         max_weight: None,
     };
 
-    let candidates = vec![
+    let candidates = [
         Candidate {
             value: 100_000,
             weight: 100,
@@ -253,7 +256,8 @@ fn does_not_create_change_below_spend_cost() {
         },
     ];
 
-    let mut cs = CoinSelector::new(&candidates, target);
+    let problem_6 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs = CoinSelector::new(&problem_6);
 
     let drain_weights = DrainWeights {
         output_weight: 100,
@@ -270,11 +274,9 @@ fn does_not_create_change_below_spend_cost() {
     let (score, _) = common::bnb_search(&mut cs, metric, 10).expect("finds solution");
 
     // The optimal selection is candidate 0 alone, and it must be changeless.
-    let expected = {
-        let mut expected = CoinSelector::new(&candidates, target);
-        expected.select(0);
-        expected
-    };
+    let problem_7 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut expected = CoinSelector::new(&problem_7);
+    expected.select(0);
     assert_eq!(cs.selected_indices(), expected.selected_indices());
     assert!(
         metric.drain(&cs).is_none(),
@@ -309,7 +311,7 @@ fn zero_fee_tx() {
         max_weight: None,
     };
 
-    let candidates = vec![
+    let candidates = [
         Candidate {
             value: 100_000,
             weight: 100,
@@ -330,7 +332,8 @@ fn zero_fee_tx() {
         n_outputs: 1,
     };
 
-    let mut cs = CoinSelector::new(&candidates, target);
+    let problem_8 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs = CoinSelector::new(&problem_8);
     let metric = LowestFee {
         long_term_feerate,
         dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
@@ -375,7 +378,8 @@ fn run_bnb_reports_insufficient_funds() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut cs = CoinSelector::new(&candidates, target);
+    let problem_9 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs = CoinSelector::new(&problem_9);
     assert_eq!(
         cs.run_bnb(err_metric(), 100_000).unwrap_err(),
         NoBnbSolution::InsufficientFunds,
@@ -396,7 +400,8 @@ fn run_bnb_reports_max_weight_exceeded() {
         fee: TargetFee::ZERO,
         max_weight: Some(1),
     };
-    let mut cs = CoinSelector::new(&candidates, target);
+    let problem_10 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs = CoinSelector::new(&problem_10);
     assert_eq!(
         cs.run_bnb(err_metric(), 100_000).unwrap_err(),
         NoBnbSolution::MaxWeightExceeded,
@@ -416,7 +421,8 @@ fn run_bnb_reports_round_limit() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut cs = CoinSelector::new(&candidates, target);
+    let problem_11 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut cs = CoinSelector::new(&problem_11);
     assert_eq!(
         cs.run_bnb(err_metric(), 0).unwrap_err(),
         NoBnbSolution::RoundLimit {

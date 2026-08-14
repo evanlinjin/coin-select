@@ -1,7 +1,8 @@
 #![allow(clippy::zero_prefixed_literal)]
 
 use bdk_coin_select::{
-    Candidate, CoinSelector, Drain, DrainWeights, Target, TargetFee, TargetOutputs,
+    Candidate, CoinSelector, Drain, DrainWeights, SelectionProblem, Target, TargetFee,
+    TargetOutputs,
 };
 use bitcoin::{consensus::Decodable, ScriptBuf, Transaction};
 
@@ -73,7 +74,8 @@ fn segwit_one_input_one_output() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem);
     coin_selector.select_all();
 
     assert_eq!(
@@ -120,7 +122,8 @@ fn segwit_two_inputs_one_output() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem_2 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem_2);
 
     coin_selector.select_all();
 
@@ -169,7 +172,8 @@ fn legacy_three_inputs() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem_3 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem_3);
     coin_selector.select_all();
 
     assert_eq!(
@@ -232,7 +236,8 @@ fn legacy_three_inputs_one_segwit() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem_4 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem_4);
     coin_selector.select_all();
 
     assert_eq!(
@@ -271,7 +276,8 @@ fn legacy_three_inputs_grouped() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem_5 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem_5);
     coin_selector.select_all();
 
     assert_eq!(
@@ -314,7 +320,8 @@ fn legacy_pair_grouped_with_segwit_input() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem_6 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem_6);
     coin_selector.select_all();
 
     assert_eq!(
@@ -351,7 +358,8 @@ fn mixed_group_all_inputs_one_candidate() {
         fee: TargetFee::ZERO,
         max_weight: None,
     };
-    let mut coin_selector = CoinSelector::new(&candidates, target);
+    let problem_7 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
+    let mut coin_selector = CoinSelector::new(&problem_7);
     coin_selector.select_all();
 
     assert_eq!(
