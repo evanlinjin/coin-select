@@ -29,8 +29,10 @@ use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionVie
 /// The bound uses a child-weight relaxation when ancestors are present (see
 /// [`bound`](BnbMetric::bound)): a funded node credits reachable ancestor surplus and possible future
 /// change, clamped to the monotone fee floor, while an unfunded one estimates the least child weight
-/// needed to meet each fee constraint. The `None` prunes stay off: funding is not monotone, so
-/// "select everything and it is still unfunded" does not mean the subtree is empty.
+/// needed to meet each fee constraint. Neither claims the subtree is empty, because funding is not
+/// monotone and "select everything and it is still unfunded" does not follow. Infeasibility is left
+/// to the lookahead in [`bound`](BnbMetric::bound), which relaxes the ancestor bump to its
+/// branch-wide floor instead of assuming it only grows.
 ///
 /// [`SelectionProblem`]: crate::SelectionProblem
 #[derive(Clone, Copy)]
@@ -251,8 +253,17 @@ impl BnbMetric for LowestFee {
             return None;
         }
 
-        // With unconfirmed ancestors, funding is not monotone. Use the child-weight relaxation in
-        // `bound_with_ancestors`; never claim the subtree is empty.
+        // Lookahead hard-prune (Bitcoin Core's `curr_available_value` test): if everything still
+        // undecided cannot close the feerate gap, no descendant is funded, so the subtree is empty.
+        // Funding needs every fee constraint met, so failing this one alone is enough to prune.
+        // Constant-time, and it fires before either relaxation below does any work.
+        if cs.best_reachable_rate_excess_wu() < 0 {
+            return None;
+        }
+
+        // With unconfirmed ancestors, funding is not monotone, so nothing below may claim the
+        // subtree is empty — that job belongs to the lookahead above, which relaxes the bump rather
+        // than assuming it only grows. Use the child-weight relaxation in `bound_with_ancestors`.
         if cs.problem().has_ancestors() {
             return Some(self.bound_with_ancestors(cs));
         }
