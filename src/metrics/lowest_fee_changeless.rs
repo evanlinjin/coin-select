@@ -7,13 +7,16 @@ use super::LowestFee;
 ///
 /// This reuses [`LowestFee`]'s change decision, including the future cost of spending change, its
 /// dust threshold, and the transaction weight cap. A selection is only valid here when that
-/// decision returns no change output.
+/// decision returns no change output. That includes change that is uneconomical or dust, as well as
+/// change that cannot fit the weight cap.
 ///
 /// Unlike constraining an arbitrary metric after the fact, this metric has a changeless-specific
 /// lower bound. A changeless selection's score is its selected value minus the target value. Since
 /// selected value can only increase down a branch, the current no-change fee is a lower bound for
-/// every descendant, including when unconfirmed ancestry makes funding non-monotone. The bound
-/// combines that fact with [`LowestFee`]'s funding relaxation.
+/// every descendant, including when unconfirmed ancestry makes funding non-monotone. For pools of at
+/// most 24 candidates, the bound combines that fact with [`LowestFee`]'s funding relaxation. Larger
+/// pools retain only the `LowestFee` bound and ordering because the selected-value bound can starve
+/// useful branches under a finite round limit.
 #[derive(Clone, Copy, Debug)]
 pub struct LowestFeeChangeless {
     /// The estimated feerate needed to spend a potential change output later.

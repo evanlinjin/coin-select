@@ -217,7 +217,7 @@ struct Branch<'a> {
 
 impl Ord for Branch<'_> {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // NOTE: Reverse comparision `lower_bound` because we want a min-heap (by default BinaryHeap
+        // NOTE: Reverse comparison `lower_bound` because we want a min-heap (by default BinaryHeap
         // is a max-heap).
         // NOTE: We tiebreak equal scores based on whether it's exlusion or not (preferring
         // inclusion). We do this because we want to try and get to evaluating complete selection

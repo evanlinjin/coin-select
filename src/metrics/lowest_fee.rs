@@ -13,22 +13,24 @@ use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionVie
 ///
 /// Unlike other metrics, `LowestFee` decides for itself whether a selection should have a change
 /// output: change is added whenever doing so lowers the long-term fee (i.e. the recovered excess
-/// outweighs the future cost of spending the change) and the resulting change value is above the
-/// dust threshold implied by `dust_relay_feerate`.
+/// outweighs the future cost of spending the change), the resulting value is at least the dust
+/// threshold implied by `dust_relay_feerate`, and the transaction with change fits
+/// [`Target::max_weight`](crate::Target::max_weight).
 ///
 /// # Unconfirmed ancestors
 ///
 /// When the [`SelectionProblem`] has unconfirmed ancestors, the fee a selection must pay includes
 /// the [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump) of the ancestors it drags
-/// in, so the search naturally prefers
-/// coins that drag in nothing (or that share an already-paid-for ancestor). The score itself is
-/// still the child transaction's fee — the bump is inside it, not added on top.
+/// in, so the search naturally prefers coins that drag in nothing or share an already-paid-for
+/// ancestor. Ancestor fees are netted over the union, allowing an overpaying ancestor to offset an
+/// underpaying one without subsidizing the child itself. The score remains the child transaction's
+/// fee: the bump is inside it, not added on top.
 ///
 /// The bound uses a child-weight relaxation when ancestors are present (see
-/// [`bound`](BnbMetric::bound)): a funded node uses `score − reachable surplus`, while an unfunded
-/// one estimates the least child weight needed to meet each fee constraint. The `None` prunes stay
-/// off — funding is not monotone, so "select everything and it's still unfunded" does not mean the
-/// subtree is empty.
+/// [`bound`](BnbMetric::bound)): a funded node credits reachable ancestor surplus and possible future
+/// change, clamped to the monotone fee floor, while an unfunded one estimates the least child weight
+/// needed to meet each fee constraint. The `None` prunes stay off: funding is not monotone, so
+/// "select everything and it is still unfunded" does not mean the subtree is empty.
 ///
 /// [`SelectionProblem`]: crate::SelectionProblem
 #[derive(Clone, Copy)]

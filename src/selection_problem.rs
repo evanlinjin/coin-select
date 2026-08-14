@@ -51,9 +51,12 @@ impl<Txid> From<Input<Txid>> for InputGroup<Txid> {
 /// [`CoinSelector::new`].
 ///
 /// Ancestor bump figures are stored here (not on [`Candidate`]) so candidates stay a plain
-/// description of inputs. Unknown parent ids are treated as confirmed and ignored. There is no
-/// mempool "mine" step — deficits are computed against the full ancestor set and may overestimate
-/// what Bitcoin Core would charge.
+/// description of inputs. Every unconfirmed transaction that created an input, and all of its
+/// transitive unconfirmed ancestors, must be supplied for accurate CPFP pricing. Any absent id,
+/// including an [`Input::residing_txid`] or parent id, is treated as confirmed and ignored, which
+/// can underestimate the required fee. Deficits are computed against the full supplied ancestor
+/// union; unlike Bitcoin Core, this does not remove transactions that could already be mined at an
+/// intermediate feerate, so it may also conservatively overestimate a bump.
 ///
 /// What a selection actually owes is
 /// [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump): the shortfall of the
@@ -121,6 +124,10 @@ impl SelectionProblem {
     }
 
     /// Build candidates from input groups and the unconfirmed ancestors they may drag in.
+    ///
+    /// Each input group must be non-empty, and every `AncestorToBump::txid` must be unique. Supply
+    /// every unconfirmed residing transaction and transitive unconfirmed ancestor needed for
+    /// accurate pricing; absent ids are assumed confirmed.
     ///
     /// For each input group, the residing txids and their transitive parents (restricted to
     /// `ancestors_to_bump`) form that candidate's `drags_in` set. Ancestors only one candidate can
@@ -247,15 +254,17 @@ impl SelectionProblem {
         self.candidates.is_empty()
     }
 
-    /// Ancestor units as `(weight, fee)` pairs.
+    /// Ancestors as `(weight, fee)` pairs, in the order supplied to [`SelectionProblem::new`].
+    ///
+    /// Supplied ancestors that no candidate reaches remain in this slice but are not charged.
     pub fn ancestors(&self) -> &[(u64, u64)] {
         &self.ancestors
     }
 
     /// Whether any candidate drags in an unconfirmed ancestor.
     ///
-    /// `false` means every fee calculation reduces to the plain (child-only) case, which lets
-    /// branch and bound use the tighter bounds that assume monotone funding.
+    /// `false` means every fee calculation reduces to the plain (child-only) case, allowing branch
+    /// and bound to use its tighter no-ancestor bounds.
     pub fn has_ancestors(&self) -> bool {
         self.has_private_ancestors || self.has_shared_ancestors
     }

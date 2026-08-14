@@ -10,7 +10,7 @@ use alloc::{sync::Arc, vec::Vec};
 /// `change_lower` argument of [`CoinSelector::select_srd`].
 pub const CHANGE_LOWER: u64 = 50_000;
 
-/// [`CoinSelector`] selects/deselects coins from a set of canididate coins.
+/// [`CoinSelector`] selects or deselects coins from a set of candidate coins.
 ///
 /// You can manually select coins using methods like [`select`], or automatically with methods such
 /// as [`bnb_solutions`].
@@ -32,9 +32,8 @@ impl<'a> CoinSelector<'a> {
     /// ancestor-bump data. Methods refer to candidates by index into
     /// [`SelectionProblem::candidates`].
     ///
-    /// The `CoinSelector` does not keep track of the final transaction's output count. The caller
-    /// is responsible for including the potential output-count varint weight change in the
-    /// corresponding [`DrainWeights`].
+    /// Record the number of potential change outputs in [`DrainWeights::n_outputs`]. The selector
+    /// then accounts for the resulting output-count varint weight change automatically.
     pub fn new(problem: &'a SelectionProblem) -> Self {
         let n = problem.len();
         Self {
@@ -55,7 +54,7 @@ impl<'a> CoinSelector<'a> {
         self.problem
     }
 
-    /// Build a cached read-only view of the current selection.
+    /// Build a cached view of the current selection for aggregate queries and hypothetical updates.
     pub fn compute_view(&'a self) -> SelectionView<'a> {
         SelectionView::from_selector(self)
     }
@@ -75,27 +74,26 @@ impl<'a> CoinSelector<'a> {
         self.problem.candidate(index)
     }
 
-    /// Deselect a candidate at `index`. `index` refers to its position in the original `candidates`
-    /// slice of [`SelectionProblem::candidates`].
+    /// Deselect a candidate at `index`, its position in [`SelectionProblem::candidates`].
     pub fn deselect(&mut self, index: usize) -> bool {
         self.selected.remove(index)
     }
 
-    /// Convienince method to pick elements of a slice by the indexes that are currently selected.
-    /// Obviously the slice must represent the inputs ordered in the same way as when they were
-    /// passed to `Candidates::new`.
+    /// Convenience method to pick elements of a slice by the indices that are currently selected.
+    ///
+    /// The slice must contain one element per [`SelectionProblem::candidates`] entry in construction
+    /// order.
     pub fn apply_selection<T>(&self, candidates: &'a [T]) -> impl Iterator<Item = &'a T> + '_ {
         self.selected.iter().map(move |i| &candidates[i])
     }
 
-    /// Select the input at `index`. `index` refers to its position in the original `candidates`
-    /// slice of [`SelectionProblem::candidates`].
+    /// Select the candidate at `index`, its position in [`SelectionProblem::candidates`].
     pub fn select(&mut self, index: usize) -> bool {
         assert!(index < self.problem.len());
         self.selected.insert(index)
     }
 
-    /// Select the next unselected candidate in the sorted order fo the candidates.
+    /// Select the next unselected candidate in the current candidate order.
     pub fn select_next(&mut self) -> bool {
         let next = self.unselected_indices().next();
         if let Some(next) = next {
@@ -109,7 +107,7 @@ impl<'a> CoinSelector<'a> {
     /// Ban an input from being selected. Banning the input means it won't show up in [`unselected`]
     /// or [`unselected_indices`]. Note it can still be manually selected.
     ///
-    /// `index` refers to its position in the original `candidates` slice of [`SelectionProblem::candidates`].
+    /// `index` is its position in [`SelectionProblem::candidates`].
     ///
     /// [`unselected`]: Self::unselected
     /// [`unselected_indices`]: Self::unselected_indices
@@ -124,8 +122,7 @@ impl<'a> CoinSelector<'a> {
         &self.banned
     }
 
-    /// Is the input at `index` selected. `index` refers to its position in the original
-    /// `candidates` slice of [`SelectionProblem::candidates`].
+    /// Whether the candidate at `index` in [`SelectionProblem::candidates`] is selected.
     pub fn is_selected(&self, index: usize) -> bool {
         self.selected.contains(index)
     }
@@ -524,12 +521,12 @@ impl<'a> CoinSelector<'a> {
         self.input_weight() as f32 * (feerate.spwu() - long_term_feerate.spwu())
     }
 
-    /// Sorts the candidates by the comparision function.
+    /// Sorts the candidates by the comparison function.
     ///
-    /// The comparision function takes the candidates's index and the [`Candidate`].
+    /// The comparison function takes the candidate's index and the [`Candidate`].
     ///
     /// Note this function does not change the index of the candidates after sorting, just the order
-    /// in which they will be returned when interating over them in [`candidates`] and [`unselected`].
+    /// in which they will be returned when iterating over them in [`candidates`] and [`unselected`].
     ///
     /// [`candidates`]: CoinSelector::candidates
     /// [`unselected`]: CoinSelector::unselected
@@ -544,10 +541,10 @@ impl<'a> CoinSelector<'a> {
 
     /// Sorts the candidates by the key function.
     ///
-    /// The key function takes the candidates's index and the [`Candidate`].
+    /// The key function takes the candidate's index and the [`Candidate`].
     ///
     /// Note this function does not change the index of the candidates after sorting, just the order
-    /// in which they will be returned when interating over them in [`candidates`] and [`unselected`].
+    /// in which they will be returned when iterating over them in [`candidates`] and [`unselected`].
     ///
     /// [`candidates`]: CoinSelector::candidates
     /// [`unselected`]: CoinSelector::unselected
@@ -634,7 +631,7 @@ impl<'a> CoinSelector<'a> {
             .min()
     }
 
-    /// The indices of the selelcted candidates.
+    /// The indices of the selected candidates.
     pub fn selected_indices(&self) -> &Bitset {
         &self.selected
     }
@@ -659,9 +656,8 @@ impl<'a> CoinSelector<'a> {
     /// Whether the tx implied by the current selection plus a drain of `drain_weights` is within
     /// [`Target::max_weight`]. Pass [`DrainWeights::NONE`] for a changeless tx.
     ///
-    /// Always `true` when `max_weight` is `None`. Note this is the *anti-monotone* half of
-    /// feasibility (adding inputs adds weight), so it is kept separate from the monotone
-    /// value-only [`is_funded`](Self::is_funded).
+    /// Always `true` when `max_weight` is `None`. Adding inputs cannot reduce child transaction
+    /// weight, so this constraint is kept separate from value funding.
     pub fn is_within_max_weight(&self, drain_weights: DrainWeights) -> bool {
         match self.target().max_weight {
             Some(max_weight) => self.weight(self.target().outputs, drain_weights) <= max_weight,
@@ -672,19 +668,18 @@ impl<'a> CoinSelector<'a> {
     /// Whether the selection covers the target value (i.e. [`excess`](Self::excess) is
     /// non-negative), ignoring [`Target::max_weight`].
     ///
-    /// This is **monotone** — selecting more never un-meets it — *unless* the problem has
-    /// unconfirmed ancestors, in which case adding an input can drag in an ancestor whose bump
-    /// exceeds the input's value (see [`ancestor_bump`](Self::ancestor_bump)). It deliberately does
-    /// not include the weight cap — see [`is_within_max_weight`](Self::is_within_max_weight).
+    /// Adding an input normally helps, but can increase serialization overhead, and unconfirmed
+    /// ancestors add stronger non-monotonicity when their bump exceeds the input's value (see
+    /// [`ancestor_bump`](Self::ancestor_bump)). This deliberately excludes the weight cap; see
+    /// [`is_within_max_weight`](Self::is_within_max_weight).
     pub fn is_funded_with_drain(&self, drain: Drain) -> bool {
         self.excess(drain) >= 0
     }
 
     /// Whether the selection covers the target **value** (net of input fees), i.e. [`excess`] is
-    /// non-negative. Monotone unless the problem has unconfirmed ancestors (see
-    /// [`is_funded_with_drain`] and [`ancestor_bump`]), and it deliberately does *not* check
-    /// [`Target::max_weight`] — that is the separate, anti-monotone [`is_within_max_weight`]. See
-    /// [`is_funded_with_drain`] for the version that accounts for a specific `drain`.
+    /// non-negative. It deliberately does *not* check [`Target::max_weight`]; use
+    /// [`is_within_max_weight`] for that constraint. See [`is_funded_with_drain`] for the version
+    /// that accounts for a specific `drain`.
     ///
     /// [`excess`]: Self::excess
     /// [`ancestor_bump`]: Self::ancestor_bump
@@ -706,7 +701,7 @@ impl<'a> CoinSelector<'a> {
     /// The value of the change output should have to drain the excess value while maintaining the
     /// constraints of `target` and respecting `change_policy`.
     ///
-    /// If not change output should be added according to policy then it will return `None`.
+    /// If no change output should be added according to policy, this returns `None`.
     pub fn drain_value(&self, change_policy: ChangePolicy) -> Option<u64> {
         let excess = self.excess(Drain {
             weights: change_policy.drain_weights,
@@ -750,11 +745,12 @@ impl<'a> CoinSelector<'a> {
 
     /// Select all candidates with an *effective value* greater than 0 at the provided `feerate`.
     ///
-    /// A candidate if effective if it provides more value than it takes to pay for at `feerate`.
+    /// A candidate is effective if it provides more value than it costs at `feerate`.
     ///
     /// This looks at each candidate's own value and weight only: a candidate that pays for itself
     /// but drags in an unconfirmed ancestor still counts as effective, even if the resulting
-    /// [`ancestor_bump`](Self::ancestor_bump) outweighs it.
+    /// [`ancestor_bump`](Self::ancestor_bump) outweighs it. Selection-dependent input-count and
+    /// witness serialization overhead are also excluded from this standalone calculation.
     pub fn select_all_effective(&mut self, feerate: FeeRate) {
         for i in 0..self.candidate_order.len() {
             let cand_index = self.candidate_order[i];
@@ -772,14 +768,15 @@ impl<'a> CoinSelector<'a> {
     ///
     /// # Errors
     ///
-    /// - [`SelectError::InsufficientFunds`] if the candidates can't cover the target value.
+    /// - [`SelectError::InsufficientFunds`] if this in-order greedy selection exhausts the candidates
+    ///   without covering the target value. Another subset may still work; use branch and bound to
+    ///   search for one.
     /// - [`SelectError::MaxWeightExceeded`] if the value is met but the resulting selection exceeds
     ///   [`Target::max_weight`]. Note this only reflects *this* in-order greedy selection; a
     ///   different selection might still fit the cap (use branch and bound to search for one).
     ///
-    /// With unconfirmed ancestors the same caveat applies to
-    /// [`SelectError::InsufficientFunds`]: selecting everything can fail to meet the target while
-    /// some subset (one that drags in fewer ancestors) would meet it.
+    /// This is especially relevant with unconfirmed ancestors: selecting everything can fail while
+    /// a subset that drags in less ancestor fee debt would meet the target.
     pub fn select_until_target_met(&mut self) -> Result<(), SelectError> {
         self.select_until(|cs| cs.is_funded()).ok_or_else(|| {
             SelectError::InsufficientFunds(InsufficientFunds {
@@ -878,9 +875,10 @@ impl<'a> CoinSelector<'a> {
     /// [`BnbMetric`].
     ///
     /// Not every iteration will return a solution. If a solution is found, we return the selection
-    /// and score. Each subsequent solution of the iterator guarantees a higher score than the last.
+    /// and score. Each subsequent solution guarantees a lower (better) score than the last.
     ///
-    /// Most of the time, you would want to use [`CoinSelector::run_bnb`] instead.
+    /// Most callers should use [`CoinSelector::run_bnb`] instead, especially when they need the
+    /// change output selected by the metric.
     pub fn bnb_solutions<M: BnbMetric>(
         &self,
         metric: M,

@@ -5,7 +5,7 @@
 > ⚠ This work is only ready to use by those who expect (potentially catastrophic) bugs and will have
 > the time to investigate them and contribute back to this crate.
 
-## Synopis
+## Synopsis
 
 ```rust
 use std::str::FromStr;
@@ -123,8 +123,8 @@ let candidates = [
         weight: TR_KEYSPEND_TXIN_WEIGHT,
     }
 ];
-let drain_weights = bdk_coin_select::DrainWeights::default();
-// You could determine this by looking at the user's transaction history and taking an average of the feerate.
+let drain_weights = bdk_coin_select::DrainWeights::TR_KEYSPEND;
+// A wallet-policy or fee-estimator assumption for the future spend of change.
 let long_term_feerate = FeeRate::from_sat_per_vb(10.0);
 
 let target = Target {
@@ -146,7 +146,8 @@ let dust_relay_feerate = FeeRate::from_sat_per_vb(3.0);
 
 // The LowestFee metric tries to make selections that minimize your total fees paid over time. It
 // decides for itself whether to add a change output: change is added whenever doing so reduces the
-// long-term fee (factoring in the cost to spend the output later on) and the change wouldn't be dust.
+// long-term fee (factoring in the cost to spend the output later on), the value is at least the
+// dust threshold, and the transaction with change fits its weight cap.
 let mut metric = LowestFee {
     long_term_feerate, // used to calculate the cost of spending the change output in the future
     dust_relay_feerate,
@@ -175,11 +176,55 @@ let selection = coin_selector
    .collect::<Vec<_>>();
 
 println!("we selected {} inputs", selection.len());
-println!("We are including a change output of {} value (0 means not change)", change.value);
+println!("We are including a change output of {} value (0 means no change)", change.value);
 
 
 ```
 
-# Minimum Supported Rust Version (MSRV)
+## Unconfirmed ancestors
 
-This library is compiles on rust v1.54 and above
+Use `SelectionProblem::new` when spending unconfirmed UTXOs. Supply every unconfirmed transaction
+that created an input and all of its transitive unconfirmed ancestors; missing transaction ids are
+treated as confirmed and can make the required CPFP fee too low. Parent lists contain direct parents
+only. Ancestors shared by several selected inputs are charged once over their union.
+
+```rust
+use bdk_coin_select::{
+    AncestorToBump, FeeRate, Input, SelectionProblem, Target, TargetFee, TargetOutputs,
+};
+
+let target = Target {
+    fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(5.0)),
+    outputs: TargetOutputs::fund_outputs([(136, 50_000)]),
+    max_weight: None,
+};
+let inputs = [Input {
+    value: 100_000,
+    weight: 272,
+    is_segwit: true,
+    residing_txid: "child",
+}];
+let ancestors = [
+    AncestorToBump {
+        txid: "parent",
+        weight: 400,
+        fee: 100,
+        parents: vec![],
+    },
+    AncestorToBump {
+        txid: "child",
+        weight: 600,
+        fee: 200,
+        parents: vec!["parent"],
+    },
+];
+let problem = SelectionProblem::new(target, inputs, ancestors);
+let mut coin_selector = problem.selector();
+```
+
+Adding an input may drag in more fee debt than value, so funding is not necessarily monotone for
+ancestor-aware problems. `run_bnb` accounts for this and de-duplicates shared ancestors.
+
+## Minimum Supported Rust Version (MSRV)
+
+This library compiles on Rust 1.54 and above.

@@ -1,4 +1,4 @@
-//! Cached, read-only selection queries.
+//! Cached selection queries and hypothetical updates.
 
 use alloc::{borrow::Cow, vec::Vec};
 use core::ops::Deref;
@@ -219,9 +219,12 @@ impl SelectionCache {
     }
 }
 
-/// A read-only view over a [`CoinSelector`] with cached aggregate queries.
+/// A cached view over a [`CoinSelector`] that supports hypothetical updates.
 ///
-/// Branch and bound maintains the cache incrementally. For ad-hoc use,
+/// [`add`](Self::add) and [`sub`](Self::sub) update this view's copy-on-write aggregates without
+/// changing the underlying selector. Aggregate methods on `SelectionView` reflect those updates,
+/// while [`selector`](Self::selector) and methods reached through [`Deref`] still reflect the base
+/// selector's selected set. Branch and bound maintains the cache incrementally. For ad-hoc use,
 /// [`CoinSelector::compute_view`] builds it from the current selection.
 #[derive(Clone, Debug)]
 pub struct SelectionView<'a> {
@@ -252,7 +255,7 @@ impl<'a> SelectionView<'a> {
         }
     }
 
-    /// The selector represented by this view.
+    /// The underlying selector, which is not changed by hypothetical view updates.
     pub fn selector(&self) -> &'a CoinSelector<'a> {
         self.selector
     }
@@ -270,7 +273,8 @@ impl<'a> SelectionView<'a> {
 
     /// Apply a hypothetical selection to this view's cached aggregates.
     ///
-    /// Does nothing if the candidate was already selected in the view.
+    /// Does nothing if the candidate was already selected in the view. Aggregate query methods on
+    /// this view reflect the update; selection-set methods reached through [`Deref`] do not.
     pub fn add(&mut self, index: usize) {
         self.track_selected();
         let candidate = self.selector.candidate(index);
@@ -284,7 +288,8 @@ impl<'a> SelectionView<'a> {
 
     /// Apply a hypothetical deselection to this view's cached aggregates.
     ///
-    /// Does nothing if the candidate was not selected in the view.
+    /// Does nothing if the candidate was not selected in the view. Aggregate query methods on this
+    /// view reflect the update; selection-set methods reached through [`Deref`] do not.
     pub fn sub(&mut self, index: usize) {
         self.track_selected();
         let candidate = self.selector.candidate(index);
