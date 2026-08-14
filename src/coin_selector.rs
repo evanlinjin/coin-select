@@ -893,6 +893,30 @@ impl<'a> CoinSelector<'a> {
     /// returned. Otherwise, we error with [`NoBnbSolution`].
     ///
     /// Use [`CoinSelector::bnb_solutions`] to access the branch and bound iterator directly.
+    ///
+    /// # Choosing `max_rounds`
+    ///
+    /// `max_rounds` bounds **memory as well as work**, and the first is the easier one to
+    /// underestimate. The search is best-first over a priority queue, and it holds a
+    /// [`CoinSelector`] for every branch still in that queue. Both shipped metrics have a bound
+    /// that grows as inputs are added, so the queue is always popped shallowest-first and a level
+    /// is never finished and discarded. The frontier therefore grows with the round count, and on
+    /// a pool of several hundred candidates it can reach gigabytes if allowed to run. `max_rounds`
+    /// is what holds it down.
+    ///
+    /// Two consequences for callers:
+    ///
+    /// - **Do not replace the round limit with a wall-clock deadline alone.** A time budget does
+    ///   not bound the frontier; a round limit does.
+    /// - **Always have a fallback.** Above roughly a few hundred candidates — sooner when many of
+    ///   them share unconfirmed ancestors — the search may exhaust `max_rounds` without finding
+    ///   any solution and return [`NoBnbSolution::RoundLimit`], even though one exists.
+    ///   [`CoinSelector::select_srd`] or [`CoinSelector::select_until_target_met`] will still
+    ///   produce a fundable selection.
+    ///
+    /// Branch and bound earns its cost on wallet-sized pools, where it finds selections a greedy
+    /// or random fallback would not. It contributes least where it is most expensive: large pools
+    /// with dense shared ancestry.
     pub fn run_bnb<M: BnbMetric>(
         &mut self,
         metric: M,
