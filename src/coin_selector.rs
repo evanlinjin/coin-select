@@ -401,15 +401,6 @@ impl<'a> CoinSelector<'a> {
             - self.implied_fee_from_feerate(drain.weights) as i64
     }
 
-    /// Same as [rate_excess](Self::rate_excess) except `self.target().fee.rate` is applied to the
-    /// implied transaction's weight units directly without any conversion to vbytes.
-    pub fn rate_excess_wu(&self, drain: Drain) -> i64 {
-        self.selected_value() as i64
-            - self.target().value() as i64
-            - drain.value as i64
-            - self.implied_fee_from_feerate_wu(drain.weights) as i64
-    }
-
     /// How much the current selection overshoots the value needed to satisfy `self.target().fee.absolute`
     /// and `self.target().value` (while ignoring `self.target().fee.rate`).
     pub fn absolute_excess(&self, drain: Drain) -> i64 {
@@ -430,37 +421,6 @@ impl<'a> CoinSelector<'a> {
             - self.target().value() as i64
             - drain.value as i64
             - replacement_excess_needed as i64
-    }
-
-    /// Same as [replacement_excess](Self::replacement_excess) except the replacement fee
-    /// is calculated using weight units directly without any conversion to vbytes.
-    pub fn replacement_excess_wu(&self, drain: Drain) -> i64 {
-        let mut replacement_excess_needed = 0;
-        if let Some(replace) = self.target().fee.replace {
-            replacement_excess_needed = replace
-                .min_fee_to_do_replacement_wu(self.weight(self.target().outputs, drain.weights))
-        }
-        self.selected_value() as i64
-            - self.target().value() as i64
-            - drain.value as i64
-            - replacement_excess_needed as i64
-    }
-
-    /// The feerate the transaction would have if we were to use this selection of inputs to achieve
-    /// the `target`'s value and weight. It is essentially telling you what target feerate you currently have.
-    ///
-    /// This is the *child* transaction's feerate: the fee and weight of any unconfirmed ancestors
-    /// this selection drags in are not included, so it is not the package feerate.
-    ///
-    /// Returns `None` if the feerate would be negative or infinity.
-    pub fn implied_feerate(&self, target_outputs: TargetOutputs, drain: Drain) -> Option<FeeRate> {
-        let numerator =
-            self.selected_value() as i64 - target_outputs.value_sum as i64 - drain.value as i64;
-        let denom = self.weight(target_outputs, drain.weights);
-        if numerator < 0 || denom == 0 {
-            return None;
-        }
-        Some(FeeRate::from_sat_per_wu(numerator as f32 / denom as f32))
     }
 
     /// The fee the current selection and `drain_weight` should pay to satisfy `target_fee`.
@@ -496,14 +456,6 @@ impl<'a> CoinSelector<'a> {
             + self.ancestor_bump()
     }
 
-    fn implied_fee_from_feerate_wu(&self, drain_weights: DrainWeights) -> u64 {
-        self.target()
-            .fee
-            .rate
-            .implied_fee_wu(self.weight(self.target().outputs, drain_weights))
-            + self.ancestor_bump()
-    }
-
     /// The actual fee the selection would pay if it was used in a transaction that had
     /// `target_value` value for outputs and change output of `drain_value`.
     ///
@@ -512,18 +464,7 @@ impl<'a> CoinSelector<'a> {
         self.selected_value() as i64 - target_value as i64 - drain_value as i64
     }
 
-    /// The value of the current selected inputs minus the fee needed to pay for the selected inputs
-    ///
-    /// Only the selected inputs' own weight is charged; any [`ancestor_bump`](Self::ancestor_bump)
-    /// they drag in is not.
-    pub fn effective_value(&self, feerate: FeeRate) -> i64 {
-        self.selected_value() as i64 - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
-    }
-
     // /// Waste sum of all selected inputs.
-    fn input_waste(&self, feerate: FeeRate, long_term_feerate: FeeRate) -> f32 {
-        self.input_weight() as f32 * (feerate.spwu() - long_term_feerate.spwu())
-    }
 
     /// Sorts the candidates by the comparison function.
     ///
@@ -576,34 +517,6 @@ impl<'a> CoinSelector<'a> {
             let j = (rng() % (i as u64 + 1)) as usize;
             candidates.swap(i, j);
         }
-    }
-
-    /// The waste created by the current selection as measured by the [waste metric].
-    ///
-    /// You can pass in an `excess_discount` which must be between `0.0..1.0`. Passing in `1.0` gives you no discount
-    ///
-    /// [waste metric]: https://bitcoin.stackexchange.com/questions/113622/what-does-waste-metric-mean-in-the-context-of-coin-selection
-    pub fn waste(&self, long_term_feerate: FeeRate, drain: Drain, excess_discount: f32) -> f32 {
-        debug_assert!((0.0..=1.0).contains(&excess_discount));
-        let mut waste = self.input_waste(self.target().fee.rate, long_term_feerate);
-
-        if drain.is_none() {
-            // We don't allow negative excess waste since negative excess just means you haven't
-            // satisified target yet in which case you probably shouldn't be calling this function.
-            let mut excess_waste = self.excess(drain).max(0) as f32;
-            // we allow caller to discount this waste depending on how wasteful excess actually is
-            // to them.
-            excess_waste *= excess_discount.clamp(0.0, 1.0);
-            waste += excess_waste;
-        } else {
-            waste += drain.weights.waste(
-                self.target().fee.rate,
-                long_term_feerate,
-                self.target().outputs.n_outputs,
-            );
-        }
-
-        waste
     }
 
     /// The selected candidates with their index.
