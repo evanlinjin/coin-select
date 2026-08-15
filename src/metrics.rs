@@ -5,5 +5,3 @@
 //! [`CoinSelector::run_bnb`]: crate::CoinSelector::run_bnb
 mod lowest_fee;
 pub use lowest_fee::*;
-mod lowest_fee_changeless;
-pub use lowest_fee_changeless::*;

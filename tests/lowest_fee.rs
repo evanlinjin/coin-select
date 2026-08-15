@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 mod common;
-use bdk_coin_select::metrics::{LowestFee, LowestFeeChangeless};
+use bdk_coin_select::metrics::LowestFee;
 use bdk_coin_select::{
     BnbMetric, Candidate, ChangePolicy, CoinSelector, Drain, DrainWeights, FeeRate, NoBnbSolution,
     Replace, SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
@@ -172,50 +172,6 @@ proptest! {
             bnb_found, exact_possible
         );
     }
-}
-
-/// The dedicated changeless metric shares `LowestFee`'s eligibility rules while bounding its
-/// narrower objective directly.
-#[test]
-fn combined_changeless_metric() {
-    let params = common::StrategyParams {
-        n_candidates: 100,
-        target_value: 100_000,
-        target_weight: 1000 - TX_FIXED_FIELD_WEIGHT as u32 - 1,
-        replace: None,
-        feerate: 5.0,
-        feerate_lt_diff: -4.0,
-        drain_weight: 200,
-        drain_spend_weight: 600,
-        drain_dust: 200,
-        n_target_outputs: 1,
-        n_drain_outputs: 1,
-        max_weight: None,
-    };
-
-    let candidates = common::gen_candidates(params.n_candidates);
-    let target = params.target();
-    let problem_4 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
-    let mut cs_a = CoinSelector::new(&problem_4);
-    let problem_5 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
-    let mut cs_b = CoinSelector::new(&problem_5);
-    let metric_lowest_fee = params.lowest_fee_metric();
-
-    let metric_changeless = LowestFeeChangeless::from(params.lowest_fee_metric());
-
-    // cs_a uses the unconstrained metric
-    let (score, rounds) =
-        common::bnb_search(&mut cs_a, metric_lowest_fee, usize::MAX).expect("must find solution");
-    println!("score={:?} rounds={}", score, rounds);
-
-    // cs_b uses the changeless-constrained metric
-    let (combined_score, combined_rounds) =
-        common::bnb_search(&mut cs_b, metric_changeless, usize::MAX).expect("must find solution");
-    println!("score={:?} rounds={}", combined_score, combined_rounds);
-
-    assert!(combined_score >= score);
-    let mut change_decision = params.lowest_fee_metric();
-    assert!(change_decision.drain(&cs_b.compute_view()).is_none());
 }
 
 /// Because this metric decides change optimally, it never creates a change output whose value

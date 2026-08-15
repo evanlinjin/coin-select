@@ -9,10 +9,9 @@
 mod common;
 
 use bdk_coin_select::{
-    float::Ordf32,
-    metrics::{LowestFee, LowestFeeChangeless},
-    AncestorToBump, BnbMetric, Candidate, CoinSelector, Drain, DrainWeights, FeeRate, Input,
-    Replace, SelectionProblem, Target, TargetFee, TargetOutputs, TX_FIXED_FIELD_WEIGHT,
+    float::Ordf32, metrics::LowestFee, AncestorToBump, BnbMetric, Candidate, CoinSelector, Drain,
+    DrainWeights, FeeRate, Input, Replace, SelectionProblem, Target, TargetFee, TargetOutputs,
+    TX_FIXED_FIELD_WEIGHT,
 };
 use proptest::prelude::*;
 
@@ -325,70 +324,6 @@ fn score_is_the_childs_fee_which_already_covers_the_bump() {
         cs.fee(t.value(), drain.value) as u64 >= cs.ancestor_bump(),
         "a funded selection's child fee covers the bump"
     );
-}
-
-/// A changeless solution can be reachable *only* by adding a coin whose ancestor eats the excess,
-/// which a changeless bound must account for.
-///
-/// Here the coin that kills the change looks profitable on its own (1000 sats for 200 wu). It only
-/// shrinks the excess because it drags in an ancestor owing 10_800 sats, so a bound cannot assume
-/// excess is monotone or infer that change is unavoidable from standalone effective values.
-#[test]
-fn changeless_solution_reachable_only_via_an_ancestor_is_not_pruned() {
-    let t = target(1.0, 100_000);
-    let problem = SelectionProblem::new(
-        t,
-        [
-            Input {
-                value: 110_000,
-                weight: 200,
-                is_segwit: true,
-                residing_txid: CONFIRMED,
-            },
-            Input {
-                value: 1_000,
-                weight: 200,
-                is_segwit: true,
-                residing_txid: "P",
-            },
-        ],
-        // 43_200 wu at 0.25 sat/wu => 10_800 sats owed.
-        [ancestor("P", 43_200, 0, vec![])],
-    );
-
-    let mut m = metric();
-
-    // The coin that drags in the ancestor is *not* one the prune would pick up: on its own it is
-    // worth more than it costs to spend.
-    assert!(problem.candidate(1).effective_value(t.fee.rate) > 0.0);
-
-    let mut clean_only = problem.selector();
-    clean_only.select(0);
-    assert!(clean_only.is_funded());
-    assert!(
-        m.drain(&clean_only.compute_view()).is_some(),
-        "the clean coin on its own overshoots enough to warrant change"
-    );
-
-    let mut both = problem.selector();
-    both.select(0);
-    both.select(1);
-    assert_eq!(both.ancestor_bump(), 10_800);
-    assert!(both.is_funded(), "still funded after paying the bump");
-    assert!(
-        m.drain(&both.compute_view()).is_none(),
-        "the bump leaves too little excess to be worth a change output"
-    );
-
-    // So the only changeless solution is both coins together, reachable only *through* the node
-    // that has change.
-    let mut cs = problem.selector();
-    let (score, drain) = cs
-        .run_bnb(LowestFeeChangeless::from(metric()), 100_000)
-        .expect("the changeless solution must not be pruned");
-    assert!(drain.is_none());
-    assert!(cs.is_selected(0) && cs.is_selected(1));
-    assert_eq!(score, Ordf32(11_000.0));
 }
 
 // --- the bump lower bound used by `LowestFee`'s bound ---
@@ -1076,31 +1011,4 @@ proptest! {
         }
     }
 
-    /// Same for the dedicated changeless metric, including capped problems.
-    #[test]
-    fn changeless_bnb_finds_the_brute_force_optimum(
-        spec in spec_strategy(),
-    ) {
-        let problem = spec.build();
-
-        let mut exhaustive_cs = problem.selector();
-        let mut exhaustive_metric = LowestFeeChangeless::from(metric());
-        let expected = common::exhaustive_search(&mut exhaustive_cs, &mut exhaustive_metric);
-
-        let mut bnb_cs = problem.selector();
-        let found = common::bnb_search(&mut bnb_cs, LowestFeeChangeless::from(metric()), usize::MAX);
-
-        match (expected, found) {
-            (Some((expected_score, _)), Ok((score, _))) => {
-                prop_assert_eq!(score, expected_score, "bnb={} exhaustive={}", bnb_cs, exhaustive_cs);
-            }
-            (None, Err(_)) => {}
-            (expected, found) => prop_assert!(
-                false,
-                "disagreement: exhaustive={:?} bnb={:?}",
-                expected.map(|(score, _)| score),
-                found.map(|(score, _)| score),
-            ),
-        }
-    }
 }

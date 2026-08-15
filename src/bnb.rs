@@ -105,9 +105,8 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
     /// seed costs one round and one scored selection, and since it is only an incumbent — the bound
     /// is unchanged and still admissible — the optimum stays reachable.
     ///
-    /// It yields nothing for a metric that rejects the greedy prefix outright, such as
-    /// [`LowestFeeChangeless`](crate::metrics::LowestFeeChangeless): overshooting the target is
-    /// exactly what a greedy pass does, and exactly what that metric will not score.
+    /// It yields nothing for a metric that rejects the greedy prefix outright: overshooting the
+    /// target is exactly what a greedy pass does.
     fn seed_greedy_incumbent(&mut self) {
         let mut seed = self.selector.clone();
         if seed.select_until_target_met().is_err() {
