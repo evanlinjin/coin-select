@@ -187,17 +187,8 @@ impl LowestFee {
             )
         });
 
-        // Scan in f64 rather than trusting the f32 candidate ordering: two exact ratios can tie in
-        // f32, and choosing the lower one would overstate the required weight.
-        let mut best_value = 0.0_f64;
-        let mut weightless_value = false;
-        for (_, candidate) in cs.unselected() {
-            if candidate.weight == 0 {
-                weightless_value |= candidate.value > 0;
-            } else {
-                best_value = best_value.max(candidate.value as f64 / candidate.weight as f64);
-            }
-        }
+        let best_value = cs.best_undecided_value_pwu();
+        let weightless_value = cs.has_weightless_undecided_value();
         let best_rate_gain = (best_value - target_rate).max(0.0);
         let best_replace_gain = (best_value - replace_rate).max(0.0);
 

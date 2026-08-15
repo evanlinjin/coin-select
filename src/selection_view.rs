@@ -32,6 +32,9 @@ pub(crate) struct SelectionCache {
     /// stays an upper bound on what the rest of this branch can still contribute.
     undecided_value: u64,
     undecided_weight: u64,
+    /// Undecided candidates that weigh nothing but carry value. They make every fee deficit
+    /// closable at zero added weight, so the bound must know whether any remain.
+    undecided_weightless_value: usize,
     selected: Bitset,
 }
 
@@ -67,6 +70,7 @@ impl SelectionCache {
             ancestor_fee_precision_slack: selector.problem().ancestor_fee_precision_slack(),
             undecided_value: 0,
             undecided_weight: 0,
+            undecided_weightless_value: 0,
             // BnB transitions each candidate exactly once, so it needs no duplicate-tracking
             // bitset. Public hypothetical updates allocate this lazily in `track_selected`.
             selected: Bitset::default(),
@@ -106,6 +110,9 @@ impl SelectionCache {
             let candidate = problem.candidate(index);
             self.undecided_value += candidate.value;
             self.undecided_weight += candidate.weight;
+            if candidate.weight == 0 && candidate.value > 0 {
+                self.undecided_weightless_value += 1;
+            }
         }
         if !problem.has_ancestors() {
             return;
@@ -132,6 +139,9 @@ impl SelectionCache {
             let candidate = problem.candidate(index);
             self.undecided_value -= candidate.value;
             self.undecided_weight -= candidate.weight;
+            if candidate.weight == 0 && candidate.value > 0 {
+                self.undecided_weightless_value -= 1;
+            }
         }
         if !problem.has_ancestors() {
             return;
@@ -374,6 +384,55 @@ impl<'a> SelectionView<'a> {
             .rate
             .implied_fee_wu(weight)
             .saturating_sub(fee)
+    }
+
+    /// Whether any undecided candidate weighs nothing but carries value.
+    ///
+    /// Such a candidate closes any fee deficit at zero added weight, so no relaxation may claim a
+    /// deficit is unreachable while one remains.
+    pub(crate) fn has_weightless_undecided_value(&self) -> bool {
+        self.cache.undecided_weightless_value > 0
+    }
+
+    /// The greatest value-per-weight among undecided candidates, in `f64`.
+    ///
+    /// Candidates are ordered by *`f32`* value-per-weight, so the `f64` maximum can only lie inside
+    /// the run sharing the first undecided candidate's `f32` key: two exact ratios can tie in `f32`
+    /// and be ordered either way, and picking the lower one would overstate the weight a deficit
+    /// needs. Scanning that run rather than the whole tail keeps the exact answer while making the
+    /// query independent of the pool size, which matters because branch and bound asks it at every
+    /// unfunded node.
+    ///
+    /// Zero-weight candidates sort first (their ratio is infinite) and are skipped here; use
+    /// [`has_weightless_undecided_value`](Self::has_weightless_undecided_value) for those.
+    ///
+    /// Assumes the descending value-per-weight order that
+    /// [`BnbMetric::requires_ordering_by_descending_value_pwu`](crate::BnbMetric::requires_ordering_by_descending_value_pwu)
+    /// asks for; a debug assertion checks the result against a full scan.
+    pub(crate) fn best_undecided_value_pwu(&self) -> f64 {
+        let mut best = 0.0_f64;
+        let mut key: Option<crate::float::Ordf32> = None;
+        for (_, candidate) in self.unselected() {
+            if candidate.weight == 0 {
+                continue;
+            }
+            let candidate_key = crate::float::Ordf32(candidate.value_pwu());
+            match key {
+                None => key = Some(candidate_key),
+                Some(first) if candidate_key != first => break,
+                _ => {}
+            }
+            best = best.max(candidate.value as f64 / candidate.weight as f64);
+        }
+        debug_assert_eq!(
+            best,
+            self.unselected()
+                .filter(|(_, c)| c.weight > 0)
+                .map(|(_, c)| c.value as f64 / c.weight as f64)
+                .fold(0.0_f64, f64::max),
+            "candidates are not in descending value-per-weight order, so the tie-run scan is wrong"
+        );
+        best
     }
 
     /// Lower bound on the ancestor bump owed by this branch or any descendant.
