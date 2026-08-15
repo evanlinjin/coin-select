@@ -688,7 +688,7 @@ impl<'a> CoinSelector<'a> {
         &self,
         target: Target,
         metric: M,
-    ) -> impl Iterator<Item = Option<(CoinSelector<'a>, Ordf32)>> {
+    ) -> impl Iterator<Item = Option<(CoinSelector<'a>, u64)>> {
         crate::bnb::BnbIter::new(self.clone(), target, metric)
     }
 
@@ -704,7 +704,7 @@ impl<'a> CoinSelector<'a> {
         target: Target,
         metric: M,
         max_rounds: usize,
-    ) -> Result<(Ordf32, Drain), NoBnbSolution> {
+    ) -> Result<(u64, Drain), NoBnbSolution> {
         let mut iter = crate::bnb::BnbIter::new(self.clone(), target, metric);
         let mut rounds = 0_usize;
         let best = iter

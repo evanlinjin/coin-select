@@ -344,7 +344,7 @@ pub fn exhaustive_search<M>(
     cs: &mut CoinSelector,
     target: Target,
     metric: &mut M,
-) -> Option<(Ordf32, usize)>
+) -> Option<(u64, usize)>
 where
     M: BnbMetric,
 {
@@ -352,7 +352,7 @@ where
         cs.sort_candidates_by_descending_value_pwu();
     }
 
-    let mut best = Option::<(CoinSelector, Ordf32)>::None;
+    let mut best = Option::<(CoinSelector, u64)>::None;
     let mut rounds = 0;
 
     let iter = ExhaustiveIter::new(cs)?
@@ -404,7 +404,7 @@ pub fn bnb_search<M>(
     target: Target,
     metric: M,
     max_rounds: usize,
-) -> Result<(Ordf32, usize), NoBnbSolution>
+) -> Result<(u64, usize), NoBnbSolution>
 where
     M: BnbMetric,
 {
@@ -422,7 +422,7 @@ where
     Ok((score, rounds))
 }
 
-pub fn result_string<E>(res: &Result<(Ordf32, usize), E>, change: Drain) -> String
+pub fn result_string<E>(res: &Result<(u64, usize), E>, change: Drain) -> String
 where
     E: std::fmt::Debug,
 {
@@ -543,7 +543,7 @@ fn randomly_satisfy_target<'a, R: rand::Rng>(
 ) -> CoinSelector<'a> {
     let mut cs = cs.clone();
 
-    let mut last_score: Option<Ordf32> = None;
+    let mut last_score: Option<u64> = None;
     while let Some(next) = cs.unselected_indices().choose(rng) {
         cs.select(next);
         if cs.is_funded(target) {

@@ -1,4 +1,6 @@
-use crate::{float::Ordf32, BnbMetric, CoinSelector, Drain, DrainWeights, FeeRate, Target};
+use crate::{
+    feerate::WU_PER_KVB, BnbMetric, Candidate, CoinSelector, Drain, DrainWeights, FeeRate, Target,
+};
 
 /// Metric that aims to minimize transaction fees. The future fee for spending the change output is
 /// included in this calculation.
@@ -71,7 +73,7 @@ impl LowestFee {
     /// inside [`bound`](BnbMetric::bound): deferring the changeless rejection only loosens the lower
     /// bound and never makes it inadmissible, and `score` reuses the returned drain for its cap
     /// check so the drain is decided once.
-    fn fee_score(&self, cs: &CoinSelector<'_>, target: Target) -> Option<(Ordf32, Drain)> {
+    fn fee_score(&self, cs: &CoinSelector<'_>, target: Target) -> Option<(u64, Drain)> {
         if !cs.is_funded(target) {
             return None;
         }
@@ -88,11 +90,28 @@ impl LowestFee {
             fee_for_the_tx
         );
         let fee_for_spending_drain = drain.weights.spend_fee(self.long_term_feerate);
-        Some((
-            Ordf32((fee_for_the_tx as u64 + fee_for_spending_drain) as f32),
-            drain,
-        ))
+        Some((fee_for_the_tx as u64 + fee_for_spending_drain, drain))
     }
+}
+
+/// Raise `scale` to `num / den` if that fraction is larger.
+///
+/// `scale` is kept as an exact fraction rather than a float because it is multiplied back up by a
+/// candidate value to produce the bound; a float round-trip through the division is exactly what
+/// used to make that bound wrong. Comparing is a cross-multiplication, which stays inside `u128`
+/// for any weight and satoshi value Bitcoin can represent.
+fn raise_scale(scale: &mut (u128, u128), num: u128, den: u128) {
+    if num * scale.1 > scale.0 * den {
+        *scale = (num, den);
+    }
+}
+
+/// `candidate.effective_value(feerate)`, scaled by [`WU_PER_KVB`] so it stays an exact integer.
+///
+/// Negative when the candidate costs more to spend than it is worth.
+fn effective_value_scaled(candidate: &Candidate, feerate: FeeRate) -> i128 {
+    candidate.value as i128 * WU_PER_KVB as i128
+        - candidate.weight as i128 * feerate.sat_per_kvb() as i128
 }
 
 impl BnbMetric for LowestFee {
@@ -104,7 +123,7 @@ impl BnbMetric for LowestFee {
             })
     }
 
-    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64> {
         let (score, drain) = self.fee_score(cs, target)?;
         // A final selection must fit the weight cap. `drain_value` already refuses an over-cap
         // change, but a changeless selection can still be too heavy on its own. Reuse the drain
@@ -115,7 +134,7 @@ impl BnbMetric for LowestFee {
         Some(score)
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64> {
         // Weight hard-prune: input weight only grows as this branch is extended, so the lightest
         // solution in the subtree is this selection with no drain. If even that busts `max_weight`,
         // the whole subtree is infeasible -> prune. (Also keeps `fee_score(cs).unwrap()` below
@@ -151,15 +170,20 @@ impl BnbMetric for LowestFee {
                 // happens when the current selection is changeless only because the change would be
                 // dust: a descendant with more excess could clear the dust threshold and recover
                 // value that is currently burned to fees.
-                let cost_of_adding_change = self.drain_weights.waste(
+                // Rounded down, so the credit this bound gives itself is never larger than the
+                // cost a real descendant would pay -- otherwise the bound could exceed the true
+                // optimum and prune it.
+                let cost_of_adding_change = self.drain_weights.waste_floor(
                     target.fee.rate,
                     self.long_term_feerate,
                     target.outputs.n_outputs,
                 );
-                let cost_of_no_change = cs.excess(target, Drain::NONE);
+                // Non-negative: we're in the `is_funded` branch.
+                let cost_of_no_change = cs.excess(target, Drain::NONE) as u64;
 
-                let best_score_with_change =
-                    Ordf32(current_score.0 - cost_of_no_change as f32 + cost_of_adding_change);
+                let best_score_with_change = current_score
+                    .saturating_sub(cost_of_no_change)
+                    .saturating_add(cost_of_adding_change);
                 // max_weight-aware: realizing that improvement requires a change output AND at
                 // least one more input to lift the excess over the dust/worthwhile threshold, both
                 // of which only make the tx heavier. If there's no room for both under the cap the
@@ -208,16 +232,25 @@ impl BnbMetric for LowestFee {
             //
             // In the perfect scenario, no additional fee would be required to pay for rounding up when converting from weight units to
             // vbytes and so all fee calculations below are performed on weight units directly.
-            let rate_excess = cs.rate_excess_wu(target, Drain::NONE) as f32;
-            let mut scale = Ordf32(0.0);
+            // `scale` is held as the exact fraction `num / den`. It gets multiplied back up by
+            // `to_resize.value` below, and doing that round trip through an `f32` division is what
+            // made this bound unreliable: the result is a small fee obtained by cancelling large
+            // satoshi amounts, so the rounding error could exceed the answer, in either direction.
+            // Erring low merely loosens the bound; erring high makes it inadmissible and prunes the
+            // optimum.
+            let mut scale = (0u128, 1u128);
 
-            if rate_excess < 0.0 {
-                let remaining_value_to_reach_feerate = rate_excess.abs();
-                let effective_value_of_resized_input = to_resize.effective_value(target.fee.rate);
-                if effective_value_of_resized_input > 0.0 {
-                    let feerate_scale =
-                        remaining_value_to_reach_feerate / effective_value_of_resized_input;
-                    scale = scale.max(Ordf32(feerate_scale));
+            let rate_excess = cs.rate_excess_wu(target, Drain::NONE);
+            if rate_excess < 0 {
+                let remaining_value_to_reach_feerate = rate_excess.unsigned_abs() as u128;
+                let effective_value_of_resized_input =
+                    effective_value_scaled(&to_resize, target.fee.rate);
+                if effective_value_of_resized_input > 0 {
+                    raise_scale(
+                        &mut scale,
+                        remaining_value_to_reach_feerate * WU_PER_KVB,
+                        effective_value_of_resized_input as u128,
+                    );
                 } else {
                     return None; // we can never satisfy the constraint
                 }
@@ -226,15 +259,17 @@ impl BnbMetric for LowestFee {
             // We can use the same approach for replacement we just have to use the
             // incremental_relay_feerate.
             if let Some(replace) = target.fee.replace {
-                let replace_excess = cs.replacement_excess_wu(target, Drain::NONE) as f32;
-                if replace_excess < 0.0 {
-                    let remaining_value_to_reach_feerate = replace_excess.abs();
+                let replace_excess = cs.replacement_excess_wu(target, Drain::NONE);
+                if replace_excess < 0 {
+                    let remaining_value_to_reach_feerate = replace_excess.unsigned_abs() as u128;
                     let effective_value_of_resized_input =
-                        to_resize.effective_value(replace.incremental_relay_feerate);
-                    if effective_value_of_resized_input > 0.0 {
-                        let replace_scale =
-                            remaining_value_to_reach_feerate / effective_value_of_resized_input;
-                        scale = scale.max(Ordf32(replace_scale));
+                        effective_value_scaled(&to_resize, replace.incremental_relay_feerate);
+                    if effective_value_of_resized_input > 0 {
+                        raise_scale(
+                            &mut scale,
+                            remaining_value_to_reach_feerate * WU_PER_KVB,
+                            effective_value_of_resized_input as u128,
+                        );
                     } else {
                         return None; // we can never satisfy the constraint
                     }
@@ -243,12 +278,11 @@ impl BnbMetric for LowestFee {
             // Handle absolute fee constraint. Unlike feerate and replacement, the
             // absolute fee is a fixed amount (not weight-proportional), so we just
             // need enough raw value to cover the gap.
-            let absolute_excess = cs.absolute_excess(target, Drain::NONE) as f32;
-            if absolute_excess < 0.0 {
-                let remaining = absolute_excess.abs();
+            let absolute_excess = cs.absolute_excess(target, Drain::NONE);
+            if absolute_excess < 0 {
+                let remaining = absolute_excess.unsigned_abs() as u128;
                 if to_resize.value > 0 {
-                    let absolute_scale = remaining / to_resize.value as f32;
-                    scale = scale.max(Ordf32(absolute_scale));
+                    raise_scale(&mut scale, remaining, to_resize.value as u128);
                 } else {
                     return None; // we can never satisfy the constraint
                 }
@@ -259,11 +293,11 @@ impl BnbMetric for LowestFee {
             // so if the current weight plus even that (fractional) minimum already busts the cap,
             // no within-cap selection down this branch reaches the target -> prune. This is the
             // fractional relaxation, so it never prunes a branch with an (integer) within-cap
-            // solution.
+            // solution. Multiplied out by `scale.1` so the comparison stays exact.
             if let Some(max_weight) = target.max_weight {
-                if cs.weight(target.outputs, DrainWeights::NONE) as f32
-                    + scale.0 * to_resize.weight as f32
-                    > max_weight as f32
+                let weight = cs.weight(target.outputs, DrainWeights::NONE) as u128;
+                if weight * scale.1 + scale.0 * to_resize.weight as u128
+                    > max_weight as u128 * scale.1
                 {
                     return None;
                 }
@@ -272,16 +306,15 @@ impl BnbMetric for LowestFee {
             // `scale` could be 0 even if `is_funded` is `false` due to the latter being based on
             // rounded-up vbytes.
             //
-            // Computed in `f64` and rounded *down*. This is a small fee obtained by cancelling
-            // large sat amounts, so in `f32` the error can exceed the result itself — and in either
-            // direction. Erring low only loosens the bound, but erring high makes it inadmissible
-            // and prunes the optimum. Every real score is a whole number of sats, so flooring is
-            // admissible and absorbs what error `f64` leaves. (`as i64` truncates toward zero,
-            // which is `floor` for the non-negative case; `core` has no `f64::floor`.)
-            let ideal_fee = (scale.0 as f64 * to_resize.value as f64 + cs.selected_value() as f64
-                - target.value() as f64) as i64;
+            // Rounded down: the true best score in this subtree is a whole number of satoshis no
+            // smaller than this (fractional) ideal, so flooring keeps the bound admissible.
+            // `selected_value` and `target.value()` are whole satoshis, so they can be added after
+            // the division without affecting where it floors.
+            let ideal_fee = (scale.0 * to_resize.value as u128 / scale.1) as i128
+                + cs.selected_value() as i128
+                - target.value() as i128;
 
-            Some(Ordf32(ideal_fee.max(0) as f32))
+            Some(ideal_fee.max(0) as u64)
         }
     }
 

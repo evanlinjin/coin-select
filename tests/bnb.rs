@@ -1,6 +1,6 @@
 mod common;
 use bdk_coin_select::{
-    float::Ordf32, BnbMetric, Candidate, CoinSelector, Drain, Target, TargetFee, TargetOutputs,
+    BnbMetric, Candidate, CoinSelector, Drain, Target, TargetFee, TargetOutputs,
 };
 #[macro_use]
 extern crate alloc;
@@ -28,25 +28,23 @@ fn test_wv(mut rng: impl RngCore) -> impl Iterator<Item = Candidate> {
 /// This is just an exhaustive search
 struct MinExcessThenWeight;
 
-/// Assumes tx weight is less than 1MB.
-const EXCESS_RATIO: f32 = 1_000_000_f32;
+/// Assumes tx weight is less than 1MB, so weight never carries into the excess digits.
+const EXCESS_RATIO: u64 = 1_000_000;
 
 impl BnbMetric for MinExcessThenWeight {
-    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64> {
         let excess = cs.excess(target, Drain::NONE);
         if excess < 0 {
             None
         } else {
-            Some(Ordf32(
-                excess as f32 * EXCESS_RATIO + cs.input_weight() as f32,
-            ))
+            Some((excess as u64).saturating_mul(EXCESS_RATIO) + cs.input_weight())
         }
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64> {
         let mut cs = cs.clone();
         cs.select_until_target_met(target).ok()?;
-        Some(Ordf32(cs.input_weight() as f32))
+        Some(cs.input_weight())
     }
 
     fn drain(&mut self, _cs: &CoinSelector<'_>, _target: Target) -> Drain {

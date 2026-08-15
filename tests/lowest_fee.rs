@@ -516,3 +516,67 @@ fn bound_does_not_panic_on_f32_rounding() {
     // solution rather than merely not panicking.
     assert!(cs.run_bnb(target, metric, 100_000).is_ok());
 }
+
+/// At Bitcoin-scale amounts the old `f32` bound cancelled ~0.3 BTC quantities down to a fee of a
+/// few hundred sats, so its rounding error could exceed the result and land *above* the true
+/// optimum. `bnb.rs` keeps a branch only when `best > bound`, so an inflated bound prunes the
+/// optimum outright — silently returning a worse selection rather than failing.
+///
+/// These candidates have near-tied subset sums (a shared ~34.2M sat base plus small deltas), which
+/// is where a few sats of bound inflation is decisive. With the float bound, branch and bound
+/// returned 1261 here while the true optimum is 1258.
+#[test]
+fn bnb_does_not_prune_the_optimum_at_btc_scale() {
+    let values_and_weights = [
+        (34_236_824_u64, 597_u64),
+        (34_236_835, 460),
+        (34_236_856, 504),
+        (34_236_827, 523),
+        (34_236_835, 578),
+        (34_236_886, 504),
+        (34_236_860, 555),
+        (34_236_880, 434),
+        (34_236_886, 412),
+        (34_236_858, 404),
+    ];
+    let candidates = values_and_weights
+        .iter()
+        .map(|&(value, weight)| Candidate {
+            value,
+            weight,
+            input_count: 1,
+            is_segwit: true,
+        })
+        .collect::<Vec<_>>();
+
+    let target = Target {
+        fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(2.0)),
+        outputs: TargetOutputs {
+            value_sum: 136_946_115,
+            weight_sum: 500,
+            n_outputs: 2,
+        },
+        max_weight: None,
+    };
+    let metric = LowestFee {
+        long_term_feerate: FeeRate::from_sat_per_vb(8.0),
+        dust_relay_feerate: FeeRate::from_sat_per_vb(3.0),
+        drain_weights: DrainWeights::TR_KEYSPEND,
+    };
+
+    let mut exhaustive_cs = CoinSelector::new(&candidates);
+    let (best_score, _) =
+        common::exhaustive_search(&mut exhaustive_cs, target, &mut metric.clone())
+            .expect("exhaustive search must find a solution");
+    assert_eq!(best_score, 1258, "the true optimum for this selection");
+
+    let mut cs = CoinSelector::new(&candidates);
+    let (bnb_score, _) = cs
+        .run_bnb(target, metric, 500_000)
+        .expect("bnb must find a solution");
+
+    assert_eq!(
+        bnb_score, best_score,
+        "bnb pruned the optimum: an inflated lower bound discarded the branch containing it"
+    );
+}

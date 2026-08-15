@@ -57,6 +57,23 @@ impl DrainWeights {
             + self.spend_weight as f32 * long_term_feerate.spwu()
     }
 
+    /// Exact-integer [`waste`](Self::waste) rounded **down**.
+    ///
+    /// This feeds `LowestFee`'s lower bound, which stays admissible only while every credit it
+    /// gives is an under-estimate of the real cost — so this must never overstate. The real cost
+    /// rounds each fee component up, so flooring the exact sum is always at or below it.
+    pub(crate) fn waste_floor(
+        &self,
+        feerate: FeeRate,
+        long_term_feerate: FeeRate,
+        n_target_outputs: usize,
+    ) -> u64 {
+        let scaled = self.added_output_weight(n_target_outputs) as u128
+            * feerate.sat_per_kvb() as u128
+            + self.spend_weight as u128 * long_term_feerate.sat_per_kvb() as u128;
+        (scaled / crate::feerate::WU_PER_KVB) as u64
+    }
+
     /// Exact-integer counterpart of [`waste`](Self::waste): the satoshis it costs to add this
     /// drain, rounding each fee component up.
     fn waste_ceil(

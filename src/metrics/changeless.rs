@@ -1,4 +1,4 @@
-use crate::{bnb::BnbMetric, float::Ordf32, CoinSelector, Drain, Target};
+use crate::{bnb::BnbMetric, CoinSelector, Drain, Target};
 
 /// Constrains an `inner` metric to only changeless solutions.
 ///
@@ -49,7 +49,7 @@ impl<M: BnbMetric> BnbMetric for Changeless<M> {
         Drain::NONE
     }
 
-    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64> {
         // Reject selections that have change. We don't need an explicit target-met check: `inner`
         // returns `None` for invalid (e.g. not-target-met) selections.
         //
@@ -62,7 +62,7 @@ impl<M: BnbMetric> BnbMetric for Changeless<M> {
         self.0.score(cs, target)
     }
 
-    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32> {
+    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64> {
         if self.change_unavoidable(cs, target) {
             // every descendant has change, so no changeless solution is reachable
             None

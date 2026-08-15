@@ -1,6 +1,6 @@
 use core::cmp::Reverse;
 
-use crate::{float::Ordf32, Drain, Target};
+use crate::{Drain, Target};
 
 use super::CoinSelector;
 use alloc::collections::BinaryHeap;
@@ -10,7 +10,7 @@ use alloc::collections::BinaryHeap;
 #[derive(Debug)]
 pub(crate) struct BnbIter<'a, M: BnbMetric> {
     queue: BinaryHeap<Branch<'a>>,
-    best: Option<Ordf32>,
+    best: Option<u64>,
     /// The target the metric scores selections against.
     pub(crate) target: Target,
     /// The `BnBMetric` that will score each selection
@@ -18,7 +18,7 @@ pub(crate) struct BnbIter<'a, M: BnbMetric> {
 }
 
 impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
-    type Item = Option<(CoinSelector<'a>, Ordf32)>;
+    type Item = Option<(CoinSelector<'a>, u64)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // {
@@ -165,7 +165,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
 
 #[derive(Debug, Clone)]
 struct Branch<'a> {
-    lower_bound: Ordf32,
+    lower_bound: u64,
     selector: CoinSelector<'a>,
     is_exclusion: bool,
 }
@@ -198,14 +198,14 @@ impl PartialEq for Branch<'_> {
 
 impl Eq for Branch<'_> {}
 
-/// A branch and bound metric where we minimize the [`Ordf32`] score.
+/// A branch and bound metric where we minimize a score measured in whole satoshis.
 ///
 /// This is to be used as input for [`CoinSelector::run_bnb`] or [`CoinSelector::bnb_solutions`].
 pub trait BnbMetric {
     /// Get the score of a given selection for `target`.
     ///
     /// If this returns `None`, the selection is invalid.
-    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32>;
+    fn score(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64>;
 
     /// Get the lower bound score using a heuristic for `target`.
     ///
@@ -214,7 +214,7 @@ pub trait BnbMetric {
     ///
     /// If this returns `None`, the current branch and all descendant branches will not have valid
     /// solutions.
-    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<Ordf32>;
+    fn bound(&mut self, cs: &CoinSelector<'_>, target: Target) -> Option<u64>;
 
     /// The change output (a.k.a. drain) this metric decides on for the given selection and `target`,
     /// or [`Drain::NONE`] if it decides there should be no change.

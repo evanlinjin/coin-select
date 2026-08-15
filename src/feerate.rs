@@ -17,7 +17,7 @@ use core::ops::{Add, Sub};
 pub struct FeeRate(u64);
 
 /// Weight units per 1000 vbytes.
-const WU_PER_KVB: u128 = 4000;
+pub(crate) const WU_PER_KVB: u128 = 4000;
 /// Vbytes per 1000 vbytes.
 const VB_PER_KVB: u128 = 1000;
 
