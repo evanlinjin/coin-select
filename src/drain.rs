@@ -1,5 +1,3 @@
-#[allow(unused)] // some bug in <= 1.48.0 sees this as unused when it isn't
-use crate::float::FloatExt;
 use crate::{varint_size, FeeRate, TR_KEYSPEND_TXIN_WEIGHT, TR_SPK_WEIGHT, TXOUT_BASE_WEIGHT};
 
 /// Represents the weight costs of a drain (a.k.a. change) output.
@@ -32,10 +30,21 @@ impl DrainWeights {
         n_outputs: 0,
     };
 
+    /// The output weight this drain adds to the transaction, including the extra varint weight
+    /// from growing the output count past `n_target_outputs`.
+    fn added_output_weight(&self, n_target_outputs: usize) -> u64 {
+        let extra_varint_weight =
+            (varint_size(n_target_outputs + self.n_outputs) - varint_size(n_target_outputs)) * 4;
+        self.output_weight + extra_varint_weight
+    }
+
     /// The waste of adding this drain to a transaction according to the [waste metric].
     ///
     /// To get the precise answer you need to pass in the number of non-drain outputs (`n_target_outputs`) that you're
     /// adding to the transaction so we can include the cost of increasing the varint size of the output length.
+    ///
+    /// This is a search heuristic, so it stays a float. Where the answer is a whole number of
+    /// satoshis, the crate uses the exact integer counterpart `waste_ceil` instead.
     ///
     /// [waste metric]: https://bitcoin.stackexchange.com/questions/113622/what-does-waste-metric-mean-in-the-context-of-coin-selection
     pub fn waste(
@@ -44,16 +53,25 @@ impl DrainWeights {
         long_term_feerate: FeeRate,
         n_target_outputs: usize,
     ) -> f32 {
-        let extra_varint_weight =
-            (varint_size(n_target_outputs + self.n_outputs) - varint_size(n_target_outputs)) * 4;
-        let extra_output_weight = self.output_weight + extra_varint_weight;
-        extra_output_weight as f32 * feerate.spwu()
+        self.added_output_weight(n_target_outputs) as f32 * feerate.spwu()
             + self.spend_weight as f32 * long_term_feerate.spwu()
+    }
+
+    /// Exact-integer counterpart of [`waste`](Self::waste): the satoshis it costs to add this
+    /// drain, rounding each fee component up.
+    fn waste_ceil(
+        &self,
+        feerate: FeeRate,
+        long_term_feerate: FeeRate,
+        n_target_outputs: usize,
+    ) -> u64 {
+        feerate.implied_fee_wu(self.added_output_weight(n_target_outputs))
+            + self.spend_fee(long_term_feerate)
     }
 
     /// The fee you will pay to spend these change output(s) in the future.
     pub fn spend_fee(&self, long_term_feerate: FeeRate) -> u64 {
-        (self.spend_weight as f32 * long_term_feerate.spwu()).ceil() as u64
+        long_term_feerate.implied_fee_wu(self.spend_weight)
     }
 
     /// The minimum value a change output with these weights must have to not be considered dust
@@ -131,13 +149,11 @@ impl ChangePolicy {
         long_term_feerate: FeeRate,
     ) -> Self {
         // The output waste of a changeless solution is the excess.
-        let waste_with_change = drain_weights
-            .waste(
-                target_feerate,
-                long_term_feerate,
-                0, /* ignore varint cost for now */
-            )
-            .ceil() as u64;
+        let waste_with_change = drain_weights.waste_ceil(
+            target_feerate,
+            long_term_feerate,
+            0, /* ignore varint cost for now */
+        );
 
         Self {
             drain_weights,

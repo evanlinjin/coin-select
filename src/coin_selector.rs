@@ -1,6 +1,4 @@
 use super::*;
-#[allow(unused)] // some bug in <= 1.48.0 sees this as unused when it isn't
-use crate::float::FloatExt;
 use crate::{bitset::Bitset, bnb::BnbMetric, float::Ordf32, ChangePolicy, FeeRate, Target};
 use alloc::{sync::Arc, vec::Vec};
 
@@ -267,7 +265,7 @@ impl<'a> CoinSelector<'a> {
         if numerator < 0 || denom == 0 {
             return None;
         }
-        Some(FeeRate::from_sat_per_wu(numerator as f32 / denom as f32))
+        Some(FeeRate::from_wu(numerator as u64, denom as usize))
     }
 
     /// The fee the current selection and `drain_weight` should pay to satisfy `target_fee`.
@@ -315,7 +313,7 @@ impl<'a> CoinSelector<'a> {
 
     /// The value of the current selected inputs minus the fee needed to pay for the selected inputs
     pub fn effective_value(&self, feerate: FeeRate) -> i64 {
-        self.selected_value() as i64 - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
+        self.selected_value() as i64 - feerate.implied_fee_wu(self.input_weight()) as i64
     }
 
     // /// Waste sum of all selected inputs.

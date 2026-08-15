@@ -60,37 +60,3 @@ impl core::fmt::Display for Ordf64 {
         self.0.fmt(f)
     }
 }
-
-/// Extension trait for adding basic float ops to f32 that don't exist in core for reasons.
-pub trait FloatExt {
-    /// Adds the ceil method to `f32`
-    fn ceil(self) -> Self;
-}
-
-impl FloatExt for f32 {
-    fn ceil(self) -> Self {
-        // From https://doc.rust-lang.org/reference/expressions/operator-expr.html#type-cast-expressions
-        // > Casting from a float to an integer will round the float towards zero
-        // > Casting from an integer to float will produce the closest possible float
-        let floored_towards_zero = (self as i32) as f32;
-        if self < 0.0 || floored_towards_zero == self {
-            floored_towards_zero
-        } else {
-            floored_towards_zero + 1.0
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    #[test]
-    fn ceil32() {
-        assert_eq!((-1.1).ceil(), -1.0);
-        assert_eq!((-0.1).ceil(), 0.0);
-        assert_eq!((0.0).ceil(), 0.0);
-        assert_eq!((1.0).ceil(), 1.0);
-        assert_eq!((1.1).ceil(), 2.0);
-        assert_eq!((2.9).ceil(), 3.0);
-    }
-}
