@@ -434,3 +434,85 @@ fn run_bnb_reports_round_limit() {
         },
     );
 }
+
+/// `LowestFee::bound` used to compute `ideal_fee` in `f32` and assert it non-negative. The
+/// expression cancels large sat amounts down to a small fee, so `f32` rounding could land it just
+/// below zero and blow the assert — in release too, since it was a plain `assert!`.
+///
+/// This selection drives `scale = 52692/145266`, and `scale * 145266` comes back ~0.0039 short.
+#[test]
+fn bound_does_not_panic_on_f32_rounding() {
+    let candidates = [
+        Candidate {
+            value: 1_480_489,
+            weight: 2_663,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 4_167,
+            weight: 360,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 13_447,
+            weight: 7_597,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 17_281,
+            weight: 368,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 26_718,
+            weight: 755,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 237_889,
+            weight: 4_570,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 273_139,
+            weight: 997,
+            input_count: 1,
+            is_segwit: true,
+        },
+        Candidate {
+            value: 145_266,
+            weight: 2_124,
+            input_count: 1,
+            is_segwit: true,
+        },
+    ];
+    let target = Target {
+        fee: TargetFee::ZERO,
+        outputs: TargetOutputs {
+            value_sum: 52_692,
+            weight_sum: 208,
+            n_outputs: 1,
+        },
+        max_weight: None,
+    };
+    let metric = LowestFee {
+        long_term_feerate: FeeRate::from_sat_per_wu(0.59),
+        dust_relay_feerate: FeeRate::from_sat_per_wu(1.4),
+        drain_weights: DrainWeights {
+            output_weight: 342,
+            spend_weight: 815,
+            n_outputs: 2,
+        },
+    };
+
+    let mut cs = CoinSelector::new(&candidates);
+    // The target is trivially met (feerate and absolute fee are both zero), so this must find a
+    // solution rather than merely not panicking.
+    assert!(cs.run_bnb(target, metric, 100_000).is_ok());
+}

@@ -271,11 +271,17 @@ impl BnbMetric for LowestFee {
 
             // `scale` could be 0 even if `is_funded` is `false` due to the latter being based on
             // rounded-up vbytes.
-            let ideal_fee = scale.0 * to_resize.value as f32 + cs.selected_value() as f32
-                - target.value() as f32;
-            assert!(ideal_fee >= 0.0);
+            //
+            // Computed in `f64` and rounded *down*. This is a small fee obtained by cancelling
+            // large sat amounts, so in `f32` the error can exceed the result itself — and in either
+            // direction. Erring low only loosens the bound, but erring high makes it inadmissible
+            // and prunes the optimum. Every real score is a whole number of sats, so flooring is
+            // admissible and absorbs what error `f64` leaves. (`as i64` truncates toward zero,
+            // which is `floor` for the non-negative case; `core` has no `f64::floor`.)
+            let ideal_fee = (scale.0 as f64 * to_resize.value as f64 + cs.selected_value() as f64
+                - target.value() as f64) as i64;
 
-            Some(Ordf32(ideal_fee))
+            Some(Ordf32(ideal_fee.max(0) as f32))
         }
     }
 
