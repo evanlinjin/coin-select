@@ -274,6 +274,14 @@ impl SelectionCache {
 pub struct SelectionView<'a> {
     selector: &'a CoinSelector<'a>,
     cache: Cow<'a, SelectionCache>,
+    /// Position in the selector's candidate order before which every candidate is already decided
+    /// — selected or banned. Zero is always correct; a larger value is a promise from whoever built
+    /// the view, and only lets the undecided scan skip a prefix it would have filtered out anyway.
+    ///
+    /// Branch and bound decides candidates in order, so at depth `d` the first `d` positions are
+    /// all decided. Without this, every query for "the best undecided candidate" walks those `d`
+    /// entries first, which makes the per-node cost grow with the pool rather than with the answer.
+    decided_before: usize,
 }
 
 impl<'a> Deref for SelectionView<'a> {
@@ -286,9 +294,31 @@ impl<'a> Deref for SelectionView<'a> {
 
 impl<'a> SelectionView<'a> {
     pub(crate) fn with_cache(selector: &'a CoinSelector<'a>, cache: &'a SelectionCache) -> Self {
+        Self::with_cache_from(selector, cache, 0)
+    }
+
+    /// [`with_cache`](Self::with_cache), promising that every candidate before position
+    /// `decided_before` in the candidate order is already selected or banned.
+    ///
+    /// The promise is only ever an optimisation: it lets the undecided scan start past a prefix it
+    /// would otherwise filter away one entry at a time. A debug assertion checks it.
+    pub(crate) fn with_cache_from(
+        selector: &'a CoinSelector<'a>,
+        cache: &'a SelectionCache,
+        decided_before: usize,
+    ) -> Self {
+        debug_assert!(
+            selector
+                .candidates()
+                .take(decided_before)
+                .all(|(index, _)| selector.is_selected(index)
+                    || selector.banned().contains(index)),
+            "an undecided candidate sits before `decided_before`, so skipping the prefix would hide it",
+        );
         Self {
             selector,
             cache: Cow::Borrowed(cache),
+            decided_before,
         }
     }
 
@@ -296,7 +326,30 @@ impl<'a> SelectionView<'a> {
         Self {
             selector,
             cache: Cow::Owned(SelectionCache::from_selector(selector)),
+            decided_before: 0,
         }
+    }
+
+    /// The undecided candidates, in the selector's candidate order.
+    ///
+    /// Shadows [`CoinSelector::unselected`], which always starts at the front of the order. This
+    /// one starts past the prefix the view was built knowing is already decided, so a caller that
+    /// knows it does not pay to rediscover it. Views built outside branch and bound know nothing,
+    /// and get the same answer by the same work.
+    pub fn unselected(&self) -> impl DoubleEndedIterator<Item = (usize, Candidate)> + '_ {
+        self.selector
+            .candidates_from(self.decided_before)
+            .filter(move |(index, _)| {
+                !(self.selector.is_selected(*index) || self.selector.banned().contains(*index))
+            })
+    }
+
+    /// Shadows [`CoinSelector::min_input_weight`] so it uses the view's undecided scan.
+    ///
+    /// `LowestFee`'s bound asks for this at every funded node once `Target::max_weight` is set, and
+    /// the inherited version walks the whole candidate order to answer.
+    pub fn min_input_weight(&self) -> Option<u64> {
+        self.unselected().map(|(_, candidate)| candidate.weight).min()
     }
 
     /// The underlying selector, which is not changed by hypothetical view updates.

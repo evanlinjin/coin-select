@@ -172,9 +172,8 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
     }
 
     fn try_record_best(&mut self) -> Option<Ordf32> {
-        let score = self
-            .metric
-            .score(&SelectionView::with_cache(&self.selector, &self.cache))?;
+        let view = SelectionView::with_cache_from(&self.selector, &self.cache, self.cursor());
+        let score = self.metric.score(&view)?;
         let better = match self.best {
             Some(best_score) => score < best_score,
             None => true,
@@ -187,9 +186,15 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         }
     }
 
+    /// Bound the current node, telling the view how much of the candidate order it can skip.
+    ///
+    /// Every candidate before the cursor has already been decided — included by an inclusion frame,
+    /// or banned by an exclusion one — so a metric asking about undecided candidates never has to
+    /// look at them. That is what keeps the cost of a node proportional to the answer rather than
+    /// to the depth it was found at.
     fn bound_of_current(&mut self) -> Option<Ordf32> {
-        self.metric
-            .bound(&SelectionView::with_cache(&self.selector, &self.cache))
+        let view = SelectionView::with_cache_from(&self.selector, &self.cache, self.cursor());
+        self.metric.bound(&view)
     }
 
     fn is_promising(&self, bound: Option<Ordf32>) -> bool {
@@ -210,7 +215,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
     }
 
     fn next_candidate(&self, start: usize) -> Option<(usize, usize)> {
-        for (cursor, (index, _)) in (start..).zip(self.selector.candidates().skip(start)) {
+        for (cursor, (index, _)) in (start..).zip(self.selector.candidates_from(start)) {
             if !self.selector.is_selected(index) && !self.selector.banned().contains(index) {
                 return Some((index, cursor));
             }
@@ -229,7 +234,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         let to_ban_drags_in = self.selector.problem().drags_in(index);
         let mut banned = alloc::vec![index];
         let mut next_cursor = cursor + 1;
-        for (next_index, next) in self.selector.candidates().skip(cursor + 1) {
+        for (next_index, next) in self.selector.candidates_from(cursor + 1) {
             if self.selector.is_selected(next_index) || self.selector.banned().contains(next_index)
             {
                 next_cursor += 1;

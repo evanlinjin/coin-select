@@ -66,6 +66,21 @@ impl<'a> CoinSelector<'a> {
         self.candidate_order.iter().map(move |i| (*i, cands[*i]))
     }
 
+    /// [`candidates`](Self::candidates), skipping the first `from_position` of the sorted order.
+    ///
+    /// `from_position` is a position in that order, not an index into
+    /// [`SelectionProblem::candidates`] — unlike the `index` each item carries. It may equal the
+    /// candidate count, which yields nothing; past that is a caller bug and panics.
+    pub(crate) fn candidates_from(
+        &self,
+        from_position: usize,
+    ) -> impl DoubleEndedIterator<Item = (usize, Candidate)> + ExactSizeIterator + '_ {
+        let cands = self.problem.candidates();
+        self.candidate_order[from_position..]
+            .iter()
+            .map(move |i| (*i, cands[*i]))
+    }
+
     /// Get the candidate at `index`. `index` refers to its position in
     /// [`SelectionProblem::candidates`].
     pub fn candidate(&self, index: usize) -> Candidate {
@@ -239,6 +254,10 @@ impl<'a> CoinSelector<'a> {
     /// The candidates are returned in sorted order. See [`sort_candidates_by`].
     ///
     /// [`sort_candidates_by`]: Self::sort_candidates_by
+    /// Note [`SelectionView`](crate::SelectionView) shadows this with a version that skips the
+    /// prefix branch and bound has already decided. A method *on `CoinSelector`* that calls
+    /// `self.unselected()` gets this one even when reached through a view, so anything on the
+    /// search's hot path belongs on the view instead.
     pub fn unselected(&self) -> impl DoubleEndedIterator<Item = (usize, Candidate)> + '_ {
         let cands = self.problem.candidates();
         self.unselected_indices().map(move |i| (i, cands[i]))
