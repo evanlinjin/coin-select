@@ -8,6 +8,7 @@ pub mod deepening_stats {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     static PASSES: AtomicU64 = AtomicU64::new(0);
+    static HANDOVER: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn record_pass() {
         PASSES.fetch_add(1, Ordering::Relaxed);
@@ -18,8 +19,18 @@ pub mod deepening_stats {
         PASSES.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn record_dive_handover(nodes: u64) {
+        HANDOVER.store(nodes, Ordering::Relaxed);
+    }
+
+    /// Nodes the opening dive spent before handing over to deepening. 0 means it never handed over.
+    pub fn dive_handover() -> u64 {
+        HANDOVER.load(Ordering::Relaxed)
+    }
+
     pub fn reset() {
         PASSES.store(0, Ordering::Relaxed);
+        HANDOVER.store(0, Ordering::Relaxed);
     }
 }
 
@@ -50,6 +61,19 @@ pub(crate) struct BnbIter<'a, M: BnbMetric> {
     /// Relative step for the threshold schedule. The schedule is a speed knob, never a correctness
     /// one: raising the threshold past the next rejected bound only ever *adds* nodes to a pass.
     deepening: Option<f32>,
+    /// Still in the opening dive, before any threshold applies.
+    ///
+    /// Deepening reconstructs the queue's ordering but is not anytime: under a ceiling low enough to
+    /// be useful, the early passes may not reach a complete selection at all. On a pool too large to
+    /// exhaust that is strictly worse than diving, which reaches leaves immediately. So dive first,
+    /// and deepen only once the dive stops paying — the incumbent carries over, so the deepening
+    /// phase cannot return anything worse than the dive already found.
+    diving: bool,
+    /// Smallest number of nodes the opening dive is always given before it may hand over.
+    dive_floor: u64,
+    /// Nodes expanded so far, and the count when the incumbent last improved.
+    nodes: u64,
+    last_improvement: u64,
     /// The `BnBMetric` that will score each selection
     pub(crate) metric: M,
 }
@@ -75,6 +99,11 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
 
         if self.exhausted {
             return None;
+        }
+
+        self.nodes += 1;
+        if self.diving && self.dive_is_stalled() {
+            self.stop_diving();
         }
 
         // {
@@ -113,9 +142,18 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
     }
 
     pub(crate) fn with_deepening(
+        selector: CoinSelector<'a>,
+        metric: M,
+        deepening: Option<f32>,
+    ) -> Self {
+        Self::configured(selector, metric, deepening, None)
+    }
+
+    pub(crate) fn configured(
         mut selector: CoinSelector<'a>,
         metric: M,
         deepening: Option<f32>,
+        dive_first: Option<u64>,
     ) -> Self {
         if metric.requires_ordering_by_descending_value_pwu() {
             selector.sort_candidates_by_descending_value_pwu();
@@ -132,6 +170,10 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             threshold: None,
             next_threshold: None,
             deepening,
+            diving: dive_first.is_some() && deepening.is_some(),
+            dive_floor: dive_first.unwrap_or(0),
+            nodes: 0,
+            last_improvement: 0,
             metric,
         };
 
@@ -142,8 +184,8 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             iter.exhausted = true;
         }
 
-        // The first pass admits exactly the root.
-        if deepening.is_some() {
+        // The first pass admits exactly the root. A hybrid search sets this when it stops diving.
+        if deepening.is_some() && !iter.diving {
             iter.threshold = iter.bound_of_current();
         }
 
@@ -185,6 +227,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         };
         if better {
             self.best = Some(score);
+            self.last_improvement = self.nodes;
             Some(score)
         } else {
             None
@@ -247,8 +290,31 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         }
     }
 
+    /// Whether the opening dive has stopped paying for itself.
+    ///
+    /// The rule is self-scaling rather than a tuned constant: give up once the search has gone as
+    /// long without an improvement as it took to find the one it has. A dive that keeps creeping
+    /// downward — which is what a pool too large to exhaust does — keeps its budget; a dive that is
+    /// stuck, which is the failure this is here to fix, hands over quickly.
+    fn dive_is_stalled(&self) -> bool {
+        self.nodes.saturating_sub(self.last_improvement)
+            > self.last_improvement.max(self.dive_floor)
+    }
+
+    /// Leave the opening dive and begin deepening, keeping the incumbent the dive found.
+    fn stop_diving(&mut self) {
+        self.diving = false;
+        self.reset_to_root();
+        self.threshold = self.bound_of_current();
+        crate::bnb::deepening_stats::record_dive_handover(self.nodes);
+    }
+
     /// Raise the threshold and restart from the root. `false` means the search is over.
     fn start_next_pass(&mut self) -> bool {
+        // A dive that runs out of tree has explored everything; there is nothing to deepen into.
+        if self.diving {
+            return false;
+        }
         let eps = match self.deepening {
             Some(eps) => eps,
             None => return false,
