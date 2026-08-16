@@ -47,7 +47,7 @@ impl BnbMetric for MinExcessThenWeight {
     fn bound(&mut self, cs: &SelectionView<'_>) -> Option<Ordf32> {
         let mut cs = cs.selector().clone();
         cs.select_until_target_met().ok()?;
-        Some(Ordf32(cs.input_weight() as f32))
+        Some(Ordf32(cs.compute_view().input_weight() as f32))
     }
 
     fn drain(&mut self, _cs: &SelectionView<'_>) -> Drain {
@@ -87,7 +87,7 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
         let problem = SelectionProblem::new_no_ancestors(target, solution.iter().copied());
         let mut cs = CoinSelector::new(&problem);
         cs.select_all();
-        cs.input_weight()
+        cs.compute_view().input_weight()
     };
 
     let problem_2 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
@@ -103,8 +103,13 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
         .expect("it found a solution");
 
     assert_eq!(rounds, 62453);
-    assert_eq!(best.input_weight(), solution_weight);
-    assert_eq!(best.selected_value(), target_value, "score={:?}", score);
+    assert_eq!(best.compute_view().input_weight(), solution_weight);
+    assert_eq!(
+        best.compute_view().selected_value(),
+        target_value,
+        "score={:?}",
+        score
+    );
 }
 
 #[test]
@@ -138,7 +143,7 @@ fn bnb_finds_solution_if_possible_in_n_iter() {
         .expect("found a solution");
 
     assert_eq!(rounds, 95);
-    let excess = sol.excess(Drain::NONE);
+    let excess = sol.compute_view().excess(Drain::NONE);
     assert_eq!(excess, 0);
 }
 
@@ -193,7 +198,7 @@ proptest! {
         let solutions = cs.bnb_solutions(MinExcessThenWeight);
 
         match solutions.enumerate().filter_map(|(i, sol)| Some((i, sol?))).last() {
-            Some((_i, (sol, _score))) => assert!(sol.selected_value() >= target_value),
+            Some((_i, (sol, _score))) => assert!(sol.compute_view().selected_value() >= target_value),
             _ => prop_assert!(!cs.compute_view().is_fundable()),
         }
     }
@@ -225,7 +230,7 @@ proptest! {
             let problem_5 = SelectionProblem::new_no_ancestors(target, solution.iter().copied());
             let mut cs = CoinSelector::new(&problem_5);
             cs.select_all();
-            cs.input_weight()
+            cs.compute_view().input_weight()
         };
 
         let problem_6 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
@@ -245,7 +250,7 @@ proptest! {
             .last()
             .expect("it found a solution");
 
-        prop_assert!(best.input_weight() <= solution_weight);
-        prop_assert_eq!(best.selected_value(), target.value());
+        prop_assert!(best.compute_view().input_weight() <= solution_weight);
+        prop_assert_eq!(best.compute_view().selected_value(), target.value());
     }
 }

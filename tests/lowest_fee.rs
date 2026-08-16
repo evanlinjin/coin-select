@@ -386,7 +386,7 @@ fn run_bnb_returns_the_greedy_selection_on_a_tight_budget() {
     let problem_12 = SelectionProblem::new_no_ancestors(target, candidates.iter().copied());
     let mut cs = CoinSelector::new(&problem_12);
     cs.run_bnb(err_metric(), 1).expect("the seed is a solution");
-    assert!(cs.is_funded());
+    assert!(cs.compute_view().is_funded());
 }
 
 #[test]

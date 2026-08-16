@@ -78,7 +78,7 @@ fn bump_is_charged_on_top_of_the_childs_own_fee() {
     let mut cs = problem.selector();
     cs.select(0);
 
-    assert_eq!(cs.ancestor_bump(), 2_500);
+    assert_eq!(cs.compute_view().ancestor_bump(), 2_500);
 
     let no_ancestors = SelectionProblem::new_no_ancestors(
         t,
@@ -92,19 +92,21 @@ fn bump_is_charged_on_top_of_the_childs_own_fee() {
     let mut clean_cs = no_ancestors.selector();
     clean_cs.select(0);
 
-    assert_eq!(clean_cs.ancestor_bump(), 0);
+    assert_eq!(clean_cs.compute_view().ancestor_bump(), 0);
     assert_eq!(
-        cs.weight(t.outputs, DrainWeights::NONE),
-        clean_cs.weight(t.outputs, DrainWeights::NONE)
+        cs.compute_view().weight(t.outputs, DrainWeights::NONE),
+        clean_cs
+            .compute_view()
+            .weight(t.outputs, DrainWeights::NONE)
     );
     assert_eq!(
-        cs.excess(Drain::NONE),
-        clean_cs.excess(Drain::NONE) - 2_500,
+        cs.compute_view().excess(Drain::NONE),
+        clean_cs.compute_view().excess(Drain::NONE) - 2_500,
         "the bump is the only difference between the two selections"
     );
     assert_eq!(
-        cs.implied_fee(DrainWeights::NONE),
-        clean_cs.implied_fee(DrainWeights::NONE) + 2_500
+        cs.compute_view().implied_fee(DrainWeights::NONE),
+        clean_cs.compute_view().implied_fee(DrainWeights::NONE) + 2_500
     );
 }
 
@@ -122,13 +124,13 @@ fn dragged_in_ancestor_can_unfund_a_selection() {
 
     let mut clean_only = problem.selector();
     clean_only.select(0);
-    assert!(clean_only.is_funded());
+    assert!(clean_only.compute_view().is_funded());
 
     let mut both = problem.selector();
     both.select(0);
     both.select(1);
     assert!(
-        !both.is_funded(),
+        !both.compute_view().is_funded(),
         "adding a coin with an expensive ancestor un-funds a funded selection"
     );
 }
@@ -152,9 +154,9 @@ fn shared_ancestor_is_charged_once() {
     cs.select(1);
 
     assert_eq!(cs.selected_ancestors().len(), 1);
-    assert_eq!(cs.ancestor_bump(), 2_500);
+    assert_eq!(cs.compute_view().ancestor_bump(), 2_500);
     assert_ne!(
-        cs.ancestor_bump(),
+        cs.compute_view().ancestor_bump(),
         problem.local_bump(0) + problem.local_bump(1)
     );
 }
@@ -177,20 +179,28 @@ fn deselecting_keeps_an_ancestor_another_candidate_still_drags_in() {
 
     cs.select(0);
     cs.select(1);
-    assert_eq!(cs.ancestor_bump(), 2_500);
+    assert_eq!(cs.compute_view().ancestor_bump(), 2_500);
 
     cs.deselect(0);
-    assert_eq!(cs.ancestor_bump(), 2_500, "candidate 1 still drags in P");
+    assert_eq!(
+        cs.compute_view().ancestor_bump(),
+        2_500,
+        "candidate 1 still drags in P"
+    );
 
     cs.select(2);
     assert_eq!(
-        cs.ancestor_bump(),
+        cs.compute_view().ancestor_bump(),
         2_500,
         "a confirmed coin drags in nothing"
     );
 
     cs.deselect(1);
-    assert_eq!(cs.ancestor_bump(), 0, "nothing selected drags in P anymore");
+    assert_eq!(
+        cs.compute_view().ancestor_bump(),
+        0,
+        "nothing selected drags in P anymore"
+    );
 }
 
 /// The whole transitive chain is charged, and fees are netted across it (not per ancestor).
@@ -210,7 +220,7 @@ fn transitive_ancestors_are_netted_as_one_package() {
 
     // Union: weight 800 => 2000 sats owed at 2.5 sat/wu, of which B already paid 1000.
     assert_eq!(cs.selected_ancestors().len(), 2);
-    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
 }
 
 /// Dragging in an ancestor that overpays *lowers* what the selection owes, because the deficit is
@@ -230,17 +240,21 @@ fn overpaying_ancestor_offsets_an_underpaying_one() {
 
     let mut poor_only = problem.selector();
     poor_only.select(1);
-    assert_eq!(poor_only.ancestor_bump(), 100);
+    assert_eq!(poor_only.compute_view().ancestor_bump(), 100);
 
     let mut rich_only = problem.selector();
     rich_only.select(0);
-    assert_eq!(rich_only.ancestor_bump(), 0, "never credits the child");
+    assert_eq!(
+        rich_only.compute_view().ancestor_bump(),
+        0,
+        "never credits the child"
+    );
 
     let mut both = problem.selector();
     both.select(0);
     both.select(1);
     assert_eq!(
-        both.ancestor_bump(),
+        both.compute_view().ancestor_bump(),
         0,
         "RICH's surplus covers POOR's deficit, so the superset owes less"
     );
@@ -260,7 +274,7 @@ fn ancestor_weight_does_not_count_against_max_weight() {
     let mut cs = problem.selector();
     cs.select(0);
 
-    let child_weight = cs.weight(t.outputs, DrainWeights::NONE);
+    let child_weight = cs.compute_view().weight(t.outputs, DrainWeights::NONE);
     assert!(child_weight < heavy);
 
     t.max_weight = Some(child_weight);
@@ -271,7 +285,9 @@ fn ancestor_weight_does_not_count_against_max_weight() {
     );
     let mut capped_cs = capped.selector();
     capped_cs.select(0);
-    assert!(capped_cs.is_within_max_weight(DrainWeights::NONE));
+    assert!(capped_cs
+        .compute_view()
+        .is_within_max_weight(DrainWeights::NONE));
 }
 
 /// Two coins of equal value and weight are *not* interchangeable when only one of them drags in an
@@ -316,12 +332,12 @@ fn score_is_the_childs_fee_which_already_covers_the_bump() {
     assert_eq!(
         score,
         Ordf32(
-            (cs.fee(t.value(), drain.value) as u64 + drain.weights.spend_fee(m.long_term_feerate))
-                as f32
+            (cs.compute_view().fee(t.value(), drain.value) as u64
+                + drain.weights.spend_fee(m.long_term_feerate)) as f32
         )
     );
     assert!(
-        cs.fee(t.value(), drain.value) as u64 >= cs.ancestor_bump(),
+        cs.compute_view().fee(t.value(), drain.value) as u64 >= cs.compute_view().ancestor_bump(),
         "a funded selection's child fee covers the bump"
     );
 }
@@ -348,9 +364,9 @@ fn bump_lower_bound_is_the_full_bump_when_nothing_overpays() {
 
     let mut cs = problem.selector();
     cs.select(0);
-    assert_eq!(cs.ancestor_bump(), 2_500);
+    assert_eq!(cs.compute_view().ancestor_bump(), 2_500);
     assert_eq!(
-        cs.ancestor_bump_lower_bound(),
+        cs.compute_view().ancestor_bump_lower_bound(),
         2_500,
         "Q only ever adds to what is owed, so it cannot lower the floor"
     );
@@ -376,9 +392,9 @@ fn bump_lower_bound_gives_up_the_reachable_surplus() {
 
     let mut cs = problem.selector();
     cs.select(0);
-    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
     assert_eq!(
-        cs.ancestor_bump_lower_bound(),
+        cs.compute_view().ancestor_bump_lower_bound(),
         0,
         "RICH's 9_900 surplus swamps the 1_000 owed"
     );
@@ -386,7 +402,7 @@ fn bump_lower_bound_gives_up_the_reachable_surplus() {
     // Which is not pessimism: that descendant really does owe nothing.
     let mut both = cs.clone();
     both.select(1);
-    assert_eq!(both.ancestor_bump(), 0);
+    assert_eq!(both.compute_view().ancestor_bump(), 0);
 }
 
 /// Only the surplus actually within reach is given up.
@@ -404,22 +420,22 @@ fn bump_lower_bound_only_credits_reachable_surplus() {
 
     let mut cs = problem.selector();
     cs.select(0);
-    assert_eq!(cs.ancestor_bump(), 1_000);
-    assert_eq!(cs.ancestor_bump_lower_bound(), 0);
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump_lower_bound(), 0);
 
     // Ban the coin that would bring RICH in and the surplus is out of reach again.
     let mut banned = cs.clone();
     banned.ban(1);
     assert!(banned.addable_ancestors().is_empty());
-    assert_eq!(banned.ancestor_bump_lower_bound(), 1_000);
+    assert_eq!(banned.compute_view().ancestor_bump_lower_bound(), 1_000);
 
     // Likewise once there is nothing left to add.
     let mut exhausted = cs.clone();
     exhausted.select(1);
     assert!(exhausted.is_exhausted());
     assert_eq!(
-        exhausted.ancestor_bump_lower_bound(),
-        exhausted.ancestor_bump()
+        exhausted.compute_view().ancestor_bump_lower_bound(),
+        exhausted.compute_view().ancestor_bump()
     );
 }
 
@@ -439,7 +455,7 @@ fn bound_credits_the_bump_when_nothing_overpays() {
     let child_fee = t
         .fee
         .rate
-        .implied_fee_wu(cs.weight(t.outputs, DrainWeights::NONE));
+        .implied_fee_wu(cs.compute_view().weight(t.outputs, DrainWeights::NONE));
     let bound = metric()
         .bound(&cs.compute_view())
         .expect("within max_weight");
@@ -463,7 +479,7 @@ fn bump_lower_bound_accounts_for_large_f32_fee_rounding() {
     cs.select(0);
 
     assert!(
-        cs.ancestor_bump_lower_bound() <= cs.ancestor_bump(),
+        cs.compute_view().ancestor_bump_lower_bound() <= cs.compute_view().ancestor_bump(),
         "the f64 relaxation must not exceed the f32 fee obligation"
     );
     let view = cs.compute_view();
@@ -537,9 +553,9 @@ fn funded_bound_gives_up_reachable_surplus() {
 
     let mut cs = problem.selector();
     cs.select(0);
-    assert!(cs.is_funded());
-    assert_eq!(cs.ancestor_bump(), 1_000);
-    assert_eq!(cs.ancestor_bump_lower_bound(), 0);
+    assert!(cs.compute_view().is_funded());
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump_lower_bound(), 0);
 
     let score = metric().score(&cs.compute_view()).unwrap();
     let bound = metric().bound(&cs.compute_view()).unwrap();
@@ -607,8 +623,8 @@ fn funded_bound_subtracts_surplus_before_float_conversion() {
 
     let mut node = problem.selector();
     node.select(0);
-    assert_eq!(node.ancestor_bump(), 1_998_000_000);
-    assert_eq!(node.ancestor_bump_lower_bound(), 0);
+    assert_eq!(node.compute_view().ancestor_bump(), 1_998_000_000);
+    assert_eq!(node.compute_view().ancestor_bump_lower_bound(), 0);
     let bound = metric.bound(&node.compute_view()).unwrap();
 
     let mut descendant = node.clone();
@@ -629,7 +645,7 @@ fn unfunded_bound_does_not_claim_infeasibility() {
     );
 
     let cs = problem.selector();
-    assert!(!cs.is_funded());
+    assert!(!cs.compute_view().is_funded());
     assert!(
         metric().bound(&cs.compute_view()).is_some(),
         "an unfunded root with a live funded subset must not be pruned"
@@ -652,7 +668,7 @@ fn unfunded_bound_credits_selected_package_surplus() {
 
     let mut node = problem.selector();
     node.select(0);
-    assert!(!node.is_funded());
+    assert!(!node.compute_view().is_funded());
 
     let bound = metric().bound(&node.compute_view()).unwrap();
     let mut descendant = node.clone();
@@ -724,14 +740,14 @@ fn bump_lower_bound_nets_ancestors_that_must_arrive_together() {
 
     let mut cs = problem.selector();
     cs.select(0);
-    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
 
     // RICH's 9_900 surplus is real, but only comes with GRAN's 2_000 deficit: still a net surplus.
-    assert_eq!(cs.ancestor_bump_lower_bound(), 0);
+    assert_eq!(cs.compute_view().ancestor_bump_lower_bound(), 0);
     let mut both = cs.clone();
     both.select(1);
     assert_eq!(
-        both.ancestor_bump(),
+        both.compute_view().ancestor_bump(),
         0,
         "that descendant really owes nothing"
     );
@@ -749,9 +765,9 @@ fn bump_lower_bound_nets_ancestors_that_must_arrive_together() {
     );
     let mut cs = deep.selector();
     cs.select(0);
-    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
     assert_eq!(
-        cs.ancestor_bump_lower_bound(),
+        cs.compute_view().ancestor_bump_lower_bound(),
         1_000,
         "taking RICH means taking GRAN, which costs far more than RICH's surplus is worth"
     );
@@ -759,7 +775,7 @@ fn bump_lower_bound_nets_ancestors_that_must_arrive_together() {
     let mut both = cs.clone();
     both.select(1);
     assert!(
-        both.ancestor_bump() > 1_000,
+        both.compute_view().ancestor_bump() > 1_000,
         "confirmed by the descendant, which owes more, not less"
     );
 }
@@ -786,9 +802,9 @@ fn bump_lower_bound_credits_shared_surplus_on_its_own() {
 
     let mut cs = problem.selector();
     cs.select(0);
-    assert_eq!(cs.ancestor_bump(), 1_000);
+    assert_eq!(cs.compute_view().ancestor_bump(), 1_000);
     assert_eq!(
-        cs.ancestor_bump_lower_bound(),
+        cs.compute_view().ancestor_bump_lower_bound(),
         0,
         "RICH is reachable without HEAVY, so its surplus counts"
     );
@@ -890,11 +906,11 @@ proptest! {
         let feerate = problem.target().fee.rate;
         let cs = problem.selector();
 
-        prop_assert_eq!(cs.ancestor_bump(), expected_bump(&problem, &cs, feerate));
+        prop_assert_eq!(cs.compute_view().ancestor_bump(), expected_bump(&problem, &cs, feerate));
 
         for (node, _) in common::ExhaustiveIter::new(&cs).into_iter().flatten() {
             prop_assert_eq!(
-                node.ancestor_bump(),
+                node.compute_view().ancestor_bump(),
                 expected_bump(&problem, &node, feerate),
                 "selection={}", node
             );
@@ -916,10 +932,10 @@ proptest! {
         );
 
         for node in nodes {
-            let lower_bound = node.ancestor_bump_lower_bound();
+            let lower_bound = node.compute_view().ancestor_bump_lower_bound();
             prop_assert!(
-                lower_bound <= node.ancestor_bump(),
-                "node={} lb={} owes={}", node, lower_bound, node.ancestor_bump()
+                lower_bound <= node.compute_view().ancestor_bump(),
+                "node={} lb={} owes={}", node, lower_bound, node.compute_view().ancestor_bump()
             );
 
             for (descendant, inclusion) in common::ExhaustiveIter::new(&node).into_iter().flatten() {
@@ -927,9 +943,9 @@ proptest! {
                     continue;
                 }
                 prop_assert!(
-                    lower_bound <= descendant.ancestor_bump(),
+                    lower_bound <= descendant.compute_view().ancestor_bump(),
                     "node={} lb={} descendant={} owes={}",
-                    node, lower_bound, descendant, descendant.ancestor_bump()
+                    node, lower_bound, descendant, descendant.compute_view().ancestor_bump()
                 );
             }
         }

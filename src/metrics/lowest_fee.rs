@@ -20,7 +20,7 @@ use crate::{float::Ordf32, BnbMetric, Drain, DrainWeights, FeeRate, SelectionVie
 /// # Unconfirmed ancestors
 ///
 /// When the [`SelectionProblem`] has unconfirmed ancestors, the fee a selection must pay includes
-/// the [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump) of the ancestors it drags
+/// the [`SelectionView::ancestor_bump`](crate::SelectionView::ancestor_bump) of the ancestors it drags
 /// in, so the search naturally prefers coins that drag in nothing or share an already-paid-for
 /// ancestor. Ancestor fees are netted over the union, allowing an overpaying ancestor to offset an
 /// underpaying one without subsidizing the child itself. The score remains the child transaction's
@@ -91,8 +91,8 @@ impl LowestFee {
     /// check so the drain is decided once.
     ///
     /// The score is the *child* transaction's fee (plus the future cost of spending its change).
-    /// Any [`CoinSelector::ancestor_bump`] is not added on top: it is already inside the child's fee,
-    /// because covering it is what [`CoinSelector::is_funded`] demands and what the change
+    /// Any [`SelectionView::ancestor_bump`] is not added on top: it is already inside the child's fee,
+    /// because covering it is what [`SelectionView::is_funded`] demands and what the change
     /// calculation gives up.
     fn fee_score(&self, cs: &SelectionView<'_>) -> Option<(Ordf32, Drain)> {
         if !cs.is_funded() {
@@ -126,7 +126,7 @@ impl LowestFee {
         }
     }
 
-    /// Tighter than [`CoinSelector::fee_floor`] once the value shortfall proves that every funded
+    /// Tighter than [`SelectionView::fee_floor`] once the value shortfall proves that every funded
     /// descendant must add some child input weight.
     ///
     /// Returns `None` only for the one infeasibility this relaxation can actually prove: a fee

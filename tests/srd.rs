@@ -50,12 +50,12 @@ fn srd_success_yields_healthy_change_that_meets_target() {
             );
             assert_eq!(drain.weights, drain_weights);
             assert!(
-                cs.is_funded_with_drain(drain),
+                cs.compute_view().is_funded_with_drain(drain),
                 "seed {}: target not met with the returned drain",
                 seed
             );
             // The reported change equals the actual excess available to the drain.
-            let excess = cs.excess(Drain {
+            let excess = cs.compute_view().excess(Drain {
                 weights: drain_weights,
                 value: 0,
             });
@@ -134,7 +134,9 @@ fn srd_max_weight_exceeded() {
     probe
         .select_until(|cs| cs.excess(drain) >= CHANGE_LOWER as i64)
         .expect("candidates can cover target + change_lower");
-    let needed_weight = probe.weight(target(200_000, 5.0).outputs, drain_weights);
+    let needed_weight = probe
+        .compute_view()
+        .weight(target(200_000, 5.0).outputs, drain_weights);
 
     // Cap just below that, so SRD trips the weight limit as it reaches `change_lower`.
     let capped = Target {

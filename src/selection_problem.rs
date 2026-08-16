@@ -59,7 +59,7 @@ impl<Txid> From<Input<Txid>> for InputGroup<Txid> {
 /// intermediate feerate, so it may also conservatively overestimate a bump.
 ///
 /// What a selection actually owes is
-/// [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump): the shortfall of the
+/// [`SelectionView::ancestor_bump`](crate::SelectionView::ancestor_bump): the shortfall of the
 /// ancestors its selected candidates drag in, each charged once, weight and fee netted over the
 /// union.
 #[derive(Debug, Clone)]
@@ -278,7 +278,7 @@ impl SelectionProblem {
     ///
     /// Deliberately not reduced to a bump: the target rate applies to the total ancestor weight of
     /// the whole selection at once, and an ancestor paying above the rate must be able to subsidize
-    /// one paying below it. See [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump).
+    /// one paying below it. See [`SelectionView::ancestor_bump`](crate::SelectionView::ancestor_bump).
     pub fn private_ancestors(&self, index: usize) -> (u64, u64) {
         self.private[index]
     }
@@ -330,7 +330,7 @@ impl SelectionProblem {
     /// [`Target::fee`](crate::TargetFee)'s rate, as if it were the only selected candidate.
     ///
     /// Informational: must never be summed over a selection (shared ancestors would be charged
-    /// twice). What a selection owes is [`CoinSelector::ancestor_bump`](crate::CoinSelector::ancestor_bump).
+    /// twice). What a selection owes is [`SelectionView::ancestor_bump`](crate::SelectionView::ancestor_bump).
     pub fn local_bump(&self, index: usize) -> u64 {
         bump_of(&self.ancestors, self.target.fee.rate, self.drags_in(index))
     }

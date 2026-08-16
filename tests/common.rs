@@ -72,14 +72,17 @@ where
     );
     // bonus check: ensure replacement fee is respected
     if exp_result.is_some() {
-        let selected_value = exp_selection.selected_value();
+        let selected_value = exp_selection.compute_view().selected_value();
         let drain = metric.drain(&exp_selection.compute_view());
         let target_value = target.value();
         let replace_fee = params
             .replace
             .map(|replace| {
-                replace
-                    .min_fee_to_do_replacement(exp_selection.weight(target.outputs, drain.weights))
+                replace.min_fee_to_do_replacement(
+                    exp_selection
+                        .compute_view()
+                        .weight(target.outputs, drain.weights),
+                )
             })
             .unwrap_or(0);
         assert!(selected_value - target_value - drain.value >= replace_fee);
@@ -112,14 +115,17 @@ where
             );
 
             // bonus check: ensure replacement fee is respected
-            let selected_value = selection.selected_value();
+            let selected_value = selection.compute_view().selected_value();
             let drain = bnb_metric.drain(&selection.compute_view());
             let target_value = target.value();
             let replace_fee = params
                 .replace
                 .map(|replace| {
-                    replace
-                        .min_fee_to_do_replacement(selection.weight(target.outputs, drain.weights))
+                    replace.min_fee_to_do_replacement(
+                        selection
+                            .compute_view()
+                            .weight(target.outputs, drain.weights),
+                    )
                 })
                 .unwrap_or(0);
             assert!(selected_value - target_value - drain.value >= replace_fee);
@@ -193,7 +199,7 @@ where
                         cs,
                         parent_has_change,
                         lb_score,
-                        cs.is_funded(),
+                        cs.compute_view().is_funded(),
                         descendant_cs,
                         descendant_has_change,
                         descendant_score,
@@ -391,11 +397,14 @@ where
 /// current selection) meet `target`, i.e. cover the value **and** stay within `max_weight`?
 ///
 /// Enumerates every subset via [`ExhaustiveIter`] and reuses the real
-/// [`CoinSelector::is_funded`] + [`CoinSelector::is_within_max_weight`], so it inherits the
+/// [`SelectionView::is_funded`] + [`SelectionView::is_within_max_weight`], so it inherits the
 /// exact weight model and is independent of the BnB weight prune it audits. Exponential — small `n`
 /// only.
 pub fn exact_selection_possible(cs: &CoinSelector) -> bool {
-    let feasible = |s: &CoinSelector| s.is_funded() && s.is_within_max_weight(DrainWeights::NONE);
+    let feasible = |s: &CoinSelector| {
+        let view = s.compute_view();
+        view.is_funded() && view.is_within_max_weight(DrainWeights::NONE)
+    };
     // the current selection itself (no additions) is a valid subset and isn't yielded by the iter
     feasible(cs)
         || ExhaustiveIter::new(cs)
@@ -550,8 +559,9 @@ fn randomly_satisfy_target<'a, R: rand::Rng>(
     let mut last_score: Option<Ordf32> = None;
     while let Some(next) = cs.unselected_indices().choose(rng) {
         cs.select(next);
-        if cs.is_funded() {
-            let curr_score = metric.score(&cs.compute_view());
+        let view = cs.compute_view();
+        if view.is_funded() {
+            let curr_score = metric.score(&view);
             if let Some(last_score) = last_score {
                 if curr_score.is_none() || curr_score.unwrap() > last_score {
                     break;

@@ -250,7 +250,9 @@ fn legacy_three_inputs_one_segwit() {
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector
+            .compute_view()
+            .weight(target_ouputs, DrainWeights::NONE),
         tx.weight().to_wu()
     );
 }
@@ -290,7 +292,9 @@ fn legacy_three_inputs_grouped() {
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector
+            .compute_view()
+            .weight(target_ouputs, DrainWeights::NONE),
         tx.weight().to_wu()
     );
 }
@@ -334,7 +338,9 @@ fn legacy_pair_grouped_with_segwit_input() {
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector
+            .compute_view()
+            .weight(target_ouputs, DrainWeights::NONE),
         tx.weight().to_wu()
     );
 }

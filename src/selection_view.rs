@@ -712,23 +712,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mixed_candidate_counts_match_selector() {
-        let candidates = [
-            Candidate {
-                value: 1,
-                weight: 200,
-                segwit_count: 1,
-                legacy_count: 2,
-            },
-            Candidate::new_legacy(2, 100),
-        ];
-        let problem = SelectionProblem::new_no_ancestors(target(), candidates);
-        let mut selector = problem.selector();
-        selector.select_all();
-        let view = selector.compute_view();
-        assert_eq!(view.input_weight(), selector.input_weight());
-        assert_eq!(view.selected_value(), selector.selected_value());
+    /// Straightforward iteration over the selected set, kept here as an independent reference for
+    /// the running aggregates the cache maintains.
+    fn expected_input_weight(selector: &CoinSelector<'_>) -> u64 {
+        let is_segwit_tx = selector.selected().any(|(_, c)| c.segwit_count > 0);
+        let input_count: usize = selector
+            .selected()
+            .map(|(_, c)| c.segwit_count + c.legacy_count)
+            .sum();
+        let selected_weight: u64 = selector
+            .selected()
+            .map(|(_, c)| c.weight + is_segwit_tx as u64 * c.legacy_count as u64)
+            .sum();
+        varint_size(input_count) * 4 + selected_weight + is_segwit_tx as u64 * 2
     }
 
     #[test]
@@ -801,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_matches_selector_for_every_mixed_selection() {
+    fn cache_matches_iteration_for_every_mixed_selection() {
         let candidates = [
             Candidate::new_segwit(1_000, 100),
             Candidate::new_legacy(2_000, 200),
@@ -821,9 +817,11 @@ mod tests {
                 }
             }
             let view = selector.compute_view();
-            assert_eq!(view.selected_value(), selector.selected_value());
-            assert_eq!(view.input_weight(), selector.input_weight());
-            assert_eq!(view.excess(Drain::NONE), selector.excess(Drain::NONE));
+            assert_eq!(
+                view.selected_value(),
+                selector.selected().map(|(_, c)| c.value).sum::<u64>()
+            );
+            assert_eq!(view.input_weight(), expected_input_weight(&selector));
         }
     }
 
@@ -858,7 +856,7 @@ mod tests {
         assert_eq!(view.input_weight(), {
             let mut expected = problem.selector();
             expected.select(1);
-            expected.input_weight()
+            expected_input_weight(&expected)
         });
     }
 
@@ -903,11 +901,11 @@ mod tests {
         let problem = SelectionProblem::new_no_ancestors(target, candidates);
         let mut selector = problem.selector();
         selector.select(0);
-        assert!(selector.is_funded());
+        assert!(selector.compute_view().is_funded());
 
         let mut all = selector.clone();
         all.select(1);
-        assert!(!all.is_funded());
+        assert!(!all.compute_view().is_funded());
         assert!(selector.compute_view().is_fundable());
     }
 
@@ -959,20 +957,29 @@ mod tests {
         for index in 0..2 {
             actual.select(index);
             hypothetical.add(index);
-            assert_eq!(hypothetical.ancestor_bump(), actual.ancestor_bump());
+            assert_eq!(
+                hypothetical.ancestor_bump(),
+                actual.compute_view().ancestor_bump()
+            );
             assert_eq!(
                 hypothetical.ancestor_bump_lower_bound(),
-                actual.ancestor_bump_lower_bound()
+                actual.compute_view().ancestor_bump_lower_bound()
             );
-            assert_eq!(hypothetical.excess(Drain::NONE), actual.excess(Drain::NONE));
+            assert_eq!(
+                hypothetical.excess(Drain::NONE),
+                actual.compute_view().excess(Drain::NONE)
+            );
         }
 
         actual.deselect(0);
         hypothetical.sub(0);
-        assert_eq!(hypothetical.ancestor_bump(), actual.ancestor_bump());
+        assert_eq!(
+            hypothetical.ancestor_bump(),
+            actual.compute_view().ancestor_bump()
+        );
         assert_eq!(
             hypothetical.ancestor_bump_lower_bound(),
-            actual.ancestor_bump_lower_bound()
+            actual.compute_view().ancestor_bump_lower_bound()
         );
 
         actual.ban(0);
@@ -982,7 +989,7 @@ mod tests {
             .ban(hypothetical.selector.problem(), 0);
         assert_eq!(
             hypothetical.ancestor_bump_lower_bound(),
-            actual.ancestor_bump_lower_bound()
+            actual.compute_view().ancestor_bump_lower_bound()
         );
     }
 }

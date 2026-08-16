@@ -1,9 +1,7 @@
 use super::*;
 #[allow(unused)] // some bug in <= 1.48.0 sees this as unused when it isn't
 use crate::float::FloatExt;
-use crate::{
-    bitset::Bitset, bnb::BnbMetric, float::Ordf32, ChangePolicy, FeeRate, SelectionProblem, Target,
-};
+use crate::{bitset::Bitset, bnb::BnbMetric, float::Ordf32, FeeRate, SelectionProblem, Target};
 use alloc::{sync::Arc, vec::Vec};
 
 /// The minimum change amount Bitcoin Core's `SelectCoinsSRD` targets; a sensible default for the
@@ -136,42 +134,6 @@ impl<'a> CoinSelector<'a> {
         self.selected.is_empty()
     }
 
-    /// The weight of the inputs including the witness header and the varint for the number of
-    /// inputs.
-    pub fn input_weight(&self) -> u64 {
-        let is_segwit_tx = self.selected().any(|(_, wv)| wv.segwit_count > 0);
-        let witness_header_extra_weight = is_segwit_tx as u64 * 2;
-
-        let input_count = self
-            .selected()
-            .map(|(_, wv)| wv.segwit_count + wv.legacy_count)
-            .sum::<usize>();
-        let input_varint_weight = varint_size(input_count) * 4;
-
-        let selected_weight: u64 = self
-            .selected()
-            .map(|(_, candidate)| {
-                let mut weight = candidate.weight;
-                if is_segwit_tx {
-                    // Legacy inputs do not have the witness length included in their weight field
-                    // so we need to add 1 to each if it's a segwit tx.
-                    weight += candidate.legacy_count as u64;
-                }
-                weight
-            })
-            .sum();
-
-        input_varint_weight + selected_weight + witness_header_extra_weight
-    }
-
-    /// Absolute value sum of all selected inputs.
-    pub fn selected_value(&self) -> u64 {
-        self.selected
-            .iter()
-            .map(|index| self.problem.candidates()[index].value)
-            .sum()
-    }
-
     /// The unconfirmed ancestors the current selection drags in (indices into
     /// [`SelectionProblem::ancestors`]).
     ///
@@ -188,53 +150,6 @@ impl<'a> CoinSelector<'a> {
             }
         }
         union
-    }
-
-    /// The fee (sats) this selection must pay *on top of* its own feerate obligation so the
-    /// unconfirmed ancestors it drags in reach `target.fee.rate` (CPFP).
-    ///
-    /// Charged over the ancestors this selection drags in, taken **once each** — never by summing
-    /// [`SelectionProblem::local_bump`], which would charge a shared ancestor once per candidate.
-    /// Weight and fee are netted across them, so an ancestor paying above the rate offsets one paying
-    /// below it, and the result saturates at 0 (an ancestor that overpays never funds the child).
-    ///
-    /// Most ancestors are reachable through a single candidate, and
-    /// [`SelectionProblem`] has already folded those into a per-candidate
-    /// [`private_ancestors`](SelectionProblem::private_ancestors) pair, so all this does is add them
-    /// up. Only ancestors several candidates can reach still need de-duplicating here.
-    ///
-    /// Note this makes funding **non-monotone**: selecting a candidate that drags in an
-    /// underpaying ancestor can lower [`excess`](Self::excess). It also means the bump is not
-    /// additive over candidates, and a descendant selection can owe *less* than its parent (by
-    /// dragging in an ancestor that already overpays).
-    pub fn ancestor_bump(&self) -> u64 {
-        if !self.problem.has_ancestors() {
-            return 0;
-        }
-
-        let (mut weight, mut fee) = (0_u64, 0_u64);
-        if self.problem.has_private_ancestors() {
-            for cand_index in self.selected.iter() {
-                let (private_weight, private_fee) = self.problem.private_ancestors(cand_index);
-                weight += private_weight;
-                fee += private_fee;
-            }
-        }
-
-        if self.problem.has_shared_ancestors() {
-            let shared = self.selected_shared_ancestors();
-            for anc_index in shared.iter() {
-                let (shared_weight, shared_fee) = self.problem.ancestors()[anc_index];
-                weight += shared_weight;
-                fee += shared_fee;
-            }
-        }
-
-        self.target()
-            .fee
-            .rate
-            .implied_fee_wu(weight)
-            .saturating_sub(fee)
     }
 
     /// The unconfirmed ancestors that are not dragged in yet but could still be, i.e. those of the
@@ -255,216 +170,6 @@ impl<'a> CoinSelector<'a> {
         }
         union
     }
-
-    /// The least [`ancestor_bump`](Self::ancestor_bump) this selection — or any selection extending
-    /// it — could still owe.
-    ///
-    /// This is **not** the bump of the current selection. A later coin can drag in an ancestor that
-    /// already overpays the target rate; that surplus nets against the deficit, so a descendant can
-    /// owe *less*. This method credits every still-reachable surplus and floors at zero:
-    ///
-    /// ```text
-    /// bump of this selection, and of every selection that adds more coins
-    ///     >=  max(0, currently_owed − reachable_surplus)
-    /// ```
-    ///
-    /// where `currently_owed` is `rate · ancestor_weight − ancestor_fee` of this selection, and
-    /// `reachable_surplus` is how much still-addable ancestors overpay the target rate.
-    ///
-    /// Surplus cannot be picked up ancestor by ancestor: ancestors arrive by selecting a
-    /// *candidate*, which drags in its whole transitive set. So `reachable_surplus` is accumulated
-    /// per group that must arrive together — the split [`SelectionProblem`] already computed:
-    ///
-    /// - Ancestors only one candidate can reach ([`private_ancestors`]) are netted as a group, and
-    ///   contribute only if the group as a whole is in surplus. A chain whose tip overpays but which
-    ///   nets to a deficit therefore offers nothing.
-    /// - Ancestors several candidates can reach ([`shared_drags_in`]) are credited individually,
-    ///   since which candidate brings them — and what else it brings — is not pinned down.
-    ///
-    /// This is still a relaxation: those groups may not be reachable *together*, and reaching them at
-    /// all means adding candidates (and their child weight). Both only push the real figure up. When
-    /// nothing reachable overpays, the bound equals the current bump.
-    ///
-    /// Computed in floating point and floored, so it can sit a fraction of a satoshi below the exact
-    /// value — in the safe direction.
-    ///
-    /// [`private_ancestors`]: SelectionProblem::private_ancestors
-    /// [`shared_drags_in`]: SelectionProblem::shared_drags_in
-    pub fn ancestor_bump_lower_bound(&self) -> u64 {
-        if !self.problem.has_ancestors() {
-            return 0;
-        }
-        let spwu = self.target().fee.rate.spwu() as f64;
-        // What a group of ancestors still owes; negative means it pays above the target rate.
-        let owes = |(weight, fee): (u64, u64)| weight as f64 * spwu - fee as f64;
-
-        // Ancestors only one candidate can reach are netted as a group, so they need no
-        // de-duplicating: what this selection owes for them is a plain sum, and the most a descendant
-        // could shed is one group at a time.
-        let mut owed = 0.0;
-        let mut shed = 0.0;
-        if self.problem.has_private_ancestors() {
-            for cand_index in self.selected.iter() {
-                owed += owes(self.problem.private_ancestors(cand_index));
-            }
-            for cand_index in self.unselected_indices() {
-                shed += (-owes(self.problem.private_ancestors(cand_index))).max(0.0);
-            }
-        }
-
-        // Only ancestors several candidates can reach have to be gathered up, and they are credited
-        // individually since no single candidate owns them.
-        if self.problem.has_shared_ancestors() {
-            let selected_shared = self.selected_shared_ancestors();
-            for anc_index in selected_shared.iter() {
-                owed += owes(self.problem.ancestors()[anc_index]);
-            }
-
-            let mut addable_shared = Bitset::with_capacity(self.problem.ancestors().len());
-            for cand_index in self.unselected_indices() {
-                for anc_index in self.problem.shared_drags_in(cand_index).iter() {
-                    if !selected_shared.contains(anc_index) {
-                        addable_shared.insert(anc_index);
-                    }
-                }
-            }
-            for anc_index in addable_shared.iter() {
-                shed += (-owes(self.problem.ancestors()[anc_index])).max(0.0);
-            }
-        }
-
-        let bound = owed - shed;
-        if bound <= 0.0 {
-            0
-        } else {
-            // Truncating a positive float rounds down. Account for the lower precision used by the
-            // actual f32 fee calculation so this cannot sit above a descendant's real bump.
-            (bound as u64).saturating_sub(self.problem.ancestor_fee_precision_slack())
-        }
-    }
-
-    /// The ancestors this selection drags in that several candidates could have dragged in, taken
-    /// once each. Empty unless [`SelectionProblem::has_shared_ancestors`].
-    fn selected_shared_ancestors(&self) -> Bitset {
-        let mut shared = Bitset::with_capacity(match self.problem.has_shared_ancestors() {
-            true => self.problem.ancestors().len(),
-            false => 0,
-        });
-        if self.problem.has_shared_ancestors() {
-            for cand_index in self.selected.iter() {
-                for anc_index in self.problem.shared_drags_in(cand_index).iter() {
-                    shared.insert(anc_index);
-                }
-            }
-        }
-        shared
-    }
-
-    /// Current weight of transaction implied by the selection.
-    ///
-    /// If you don't have any drain outputs (only target outputs) just set drain_weights to
-    /// [`DrainWeights::NONE`].
-    pub fn weight(&self, target_ouputs: TargetOutputs, drain_weight: DrainWeights) -> u64 {
-        TX_FIXED_FIELD_WEIGHT
-            + self.input_weight()
-            + target_ouputs.output_weight_with_drain(drain_weight)
-    }
-
-    /// How much the current selection overshoots the value needed to achieve `target`.
-    ///
-    /// In order for the resulting transaction to be valid this must be 0 or above. If it's above 0
-    /// this means the transaction will overpay for what it needs to reach `target`.
-    pub fn excess(&self, drain: Drain) -> i64 {
-        self.rate_excess(drain)
-            .min(self.absolute_excess(drain))
-            .min(self.replacement_excess(drain))
-    }
-
-    /// How much extra value needs to be selected to reach the self.target().
-    pub fn missing(&self) -> u64 {
-        let excess = self.excess(Drain::NONE);
-        if excess < 0 {
-            excess.unsigned_abs()
-        } else {
-            0
-        }
-    }
-
-    /// How much the current selection overshoots the value need to satisfy `self.target().fee.rate` and
-    /// `self.target().value` (while ignoring `self.target().fee.absolute`).
-    ///
-    /// The feerate obligation includes the [`ancestor_bump`](Self::ancestor_bump).
-    pub fn rate_excess(&self, drain: Drain) -> i64 {
-        self.selected_value() as i64
-            - self.target().value() as i64
-            - drain.value as i64
-            - self.implied_fee_from_feerate(drain.weights) as i64
-    }
-
-    /// How much the current selection overshoots the value needed to satisfy `self.target().fee.absolute`
-    /// and `self.target().value` (while ignoring `self.target().fee.rate`).
-    pub fn absolute_excess(&self, drain: Drain) -> i64 {
-        self.selected_value() as i64
-            - self.target().value() as i64
-            - drain.value as i64
-            - self.target().fee.absolute as i64
-    }
-
-    /// How much the current selection overshoots the value needed to satisfy RBF's rule 4.
-    pub fn replacement_excess(&self, drain: Drain) -> i64 {
-        let mut replacement_excess_needed = 0;
-        if let Some(replace) = self.target().fee.replace {
-            replacement_excess_needed =
-                replace.min_fee_to_do_replacement(self.weight(self.target().outputs, drain.weights))
-        }
-        self.selected_value() as i64
-            - self.target().value() as i64
-            - drain.value as i64
-            - replacement_excess_needed as i64
-    }
-
-    /// The fee the current selection and `drain_weight` should pay to satisfy `target_fee`.
-    ///
-    /// This compares the fee calculated from the target feerate with the fee calculated from the
-    /// [`Replace`] constraints and returns the larger of the two.
-    ///
-    /// The feerate component includes the [`ancestor_bump`](Self::ancestor_bump); the absolute and
-    /// replacement components are child-transaction constraints and are left alone.
-    ///
-    /// `drain_weight` can be 0 to indicate no draining output.
-    pub fn implied_fee(&self, drain_weights: DrainWeights) -> u64 {
-        let mut implied_fee = self
-            .implied_fee_from_feerate(drain_weights)
-            .max(self.target().fee.absolute);
-
-        if let Some(replace) = self.target().fee.replace {
-            implied_fee = Ord::max(
-                implied_fee,
-                replace
-                    .min_fee_to_do_replacement(self.weight(self.target().outputs, drain_weights)),
-            );
-        }
-
-        implied_fee
-    }
-
-    fn implied_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {
-        self.target()
-            .fee
-            .rate
-            .implied_fee(self.weight(self.target().outputs, drain_weights))
-            + self.ancestor_bump()
-    }
-
-    /// The actual fee the selection would pay if it was used in a transaction that had
-    /// `target_value` value for outputs and change output of `drain_value`.
-    ///
-    /// This can be negative when the selection is invalid (outputs are greater than inputs).
-    pub fn fee(&self, target_value: u64, drain_value: u64) -> i64 {
-        self.selected_value() as i64 - target_value as i64 - drain_value as i64
-    }
-
-    // /// Waste sum of all selected inputs.
 
     /// Sorts the candidates by the comparison function.
     ///
@@ -570,42 +275,6 @@ impl<'a> CoinSelector<'a> {
         self.unselected_indices().next().is_none()
     }
 
-    /// Whether the tx implied by the current selection plus a drain of `drain_weights` is within
-    /// [`Target::max_weight`]. Pass [`DrainWeights::NONE`] for a changeless tx.
-    ///
-    /// Always `true` when `max_weight` is `None`. Adding inputs cannot reduce child transaction
-    /// weight, so this constraint is kept separate from value funding.
-    pub fn is_within_max_weight(&self, drain_weights: DrainWeights) -> bool {
-        match self.target().max_weight {
-            Some(max_weight) => self.weight(self.target().outputs, drain_weights) <= max_weight,
-            None => true,
-        }
-    }
-
-    /// Whether the selection covers the target value (i.e. [`excess`](Self::excess) is
-    /// non-negative), ignoring [`Target::max_weight`].
-    ///
-    /// Adding an input normally helps, but can increase serialization overhead, and unconfirmed
-    /// ancestors add stronger non-monotonicity when their bump exceeds the input's value (see
-    /// [`ancestor_bump`](Self::ancestor_bump)). This deliberately excludes the weight cap; see
-    /// [`is_within_max_weight`](Self::is_within_max_weight).
-    pub fn is_funded_with_drain(&self, drain: Drain) -> bool {
-        self.excess(drain) >= 0
-    }
-
-    /// Whether the selection covers the target **value** (net of input fees), i.e. [`excess`] is
-    /// non-negative. It deliberately does *not* check [`Target::max_weight`]; use
-    /// [`is_within_max_weight`] for that constraint. See [`is_funded_with_drain`] for the version
-    /// that accounts for a specific `drain`.
-    ///
-    /// [`excess`]: Self::excess
-    /// [`ancestor_bump`]: Self::ancestor_bump
-    /// [`is_within_max_weight`]: Self::is_within_max_weight
-    /// [`is_funded_with_drain`]: Self::is_funded_with_drain
-    pub fn is_funded(&self) -> bool {
-        self.is_funded_with_drain(Drain::NONE)
-    }
-
     /// Select all unselected candidates
     pub fn select_all(&mut self) {
         loop {
@@ -615,58 +284,13 @@ impl<'a> CoinSelector<'a> {
         }
     }
 
-    /// The value of the change output should have to drain the excess value while maintaining the
-    /// constraints of `target` and respecting `change_policy`.
-    ///
-    /// If no change output should be added according to policy, this returns `None`.
-    pub fn drain_value(&self, change_policy: ChangePolicy) -> Option<u64> {
-        let excess = self.excess(Drain {
-            weights: change_policy.drain_weights,
-            value: 0,
-        });
-        if excess > change_policy.min_value as i64 {
-            debug_assert_eq!(
-                self.is_funded(),
-                self.is_funded_with_drain(Drain {
-                    weights: change_policy.drain_weights,
-                    value: excess as u64
-                }),
-                "if the target is met without a drain it must be met after adding the drain"
-            );
-            Some(excess as u64)
-        } else {
-            None
-        }
-    }
-
-    /// Figures out whether the current selection should have a change output given the
-    /// `change_policy`. If it should not, then it will return [`Drain::NONE`]. The value of the
-    /// `Drain` will be the same as [`drain_value`].
-    ///
-    /// If [`is_funded`] returns true for this selection then [`is_funded_with_drain`] will
-    /// also be true if you pass in the drain returned from this method.
-    ///
-    /// [`drain_value`]: Self::drain_value
-    /// [`is_funded_with_drain`]: Self::is_funded_with_drain
-    /// [`is_funded`]: Self::is_funded
-    #[must_use]
-    pub fn drain(&self, change_policy: ChangePolicy) -> Drain {
-        match self.drain_value(change_policy) {
-            Some(value) => Drain {
-                weights: change_policy.drain_weights,
-                value,
-            },
-            None => Drain::NONE,
-        }
-    }
-
     /// Select all candidates with an *effective value* greater than 0 at the provided `feerate`.
     ///
     /// A candidate is effective if it provides more value than it costs at `feerate`.
     ///
     /// This looks at each candidate's own value and weight only: a candidate that pays for itself
     /// but drags in an unconfirmed ancestor still counts as effective, even if the resulting
-    /// [`ancestor_bump`](Self::ancestor_bump) outweighs it. Selection-dependent input-count and
+    /// [`ancestor_bump`](SelectionView::ancestor_bump) outweighs it. Selection-dependent input-count and
     /// witness serialization overhead are also excluded from this standalone calculation.
     pub fn select_all_effective(&mut self, feerate: FeeRate) {
         for i in 0..self.candidate_order.len() {
@@ -695,31 +319,44 @@ impl<'a> CoinSelector<'a> {
     /// This is especially relevant with unconfirmed ancestors: selecting everything can fail while
     /// a subset that drags in less ancestor fee debt would meet the target.
     pub fn select_until_target_met(&mut self) -> Result<(), SelectError> {
-        self.select_until(|cs| cs.is_funded()).ok_or_else(|| {
+        let mut excess = 0_i64;
+        let mut is_within_max_weight = true;
+        self.select_until(|view| {
+            excess = view.excess(Drain::NONE);
+            is_within_max_weight = view.is_within_max_weight(DrainWeights::NONE);
+            excess >= 0
+        })
+        .ok_or_else(|| {
             SelectError::InsufficientFunds(InsufficientFunds {
-                missing: self.excess(Drain::NONE).unsigned_abs(),
+                missing: excess.unsigned_abs(),
             })
         })?;
-        if !self.is_within_max_weight(DrainWeights::NONE) {
+        if !is_within_max_weight {
             return Err(SelectError::MaxWeightExceeded);
         }
         Ok(())
     }
 
     /// Select candidates until some predicate has been satisfied.
+    ///
+    /// The predicate is handed a [`SelectionView`] whose aggregates are updated incrementally as
+    /// candidates are selected, so a predicate built from cached queries costs the same at every
+    /// step regardless of how much is already selected.
     #[must_use]
     pub fn select_until(
         &mut self,
-        mut predicate: impl FnMut(&CoinSelector<'a>) -> bool,
+        mut predicate: impl FnMut(&SelectionView<'_>) -> bool,
     ) -> Option<()> {
+        let mut cache = SelectionCache::from_selector(self);
         loop {
-            if predicate(&*self) {
+            if predicate(&SelectionView::with_cache(self, &cache)) {
                 break Some(());
             }
 
-            if !self.select_next() {
-                break None;
-            }
+            let index = self.unselected_indices().next()?;
+            let candidate = self.candidate(index);
+            self.select(index);
+            cache.add(self.problem, index, candidate, true);
         }
     }
 
@@ -1018,7 +655,7 @@ pub struct Candidate {
     ///
     /// For legacy inputs, do *not* include the `scriptWitnessLen` byte: a legacy input only
     /// serializes an (empty) witness when the transaction has a witness section, and
-    /// [`CoinSelector::input_weight`] adds that 1 WU per legacy input once any segwit input is
+    /// [`SelectionView::input_weight`] adds that 1 WU per legacy input once any segwit input is
     /// selected.
     pub weight: u64,
     /// Total number of segwit inputs.
@@ -1030,7 +667,7 @@ pub struct Candidate {
     /// Total number of legacy (non-segwit) inputs.
     ///
     /// Each legacy input serializes an empty witness (1 WU) when the transaction has a witness
-    /// section; [`CoinSelector::input_weight`] prices this per legacy input, so grouped legacy
+    /// section; [`SelectionView::input_weight`] prices this per legacy input, so grouped legacy
     /// inputs are counted exactly.
     pub legacy_count: usize,
 }

@@ -57,10 +57,12 @@ let problem = SelectionProblem::new_no_ancestors(target, candidates);
 let mut coin_selector = CoinSelector::new(&problem);
 coin_selector.select(0);
 
-assert!(!coin_selector.is_funded(), "we didn't select enough");
-println!("we didn't select enough yet we're missing: {}", coin_selector.missing());
+// Aggregate queries live on a cached view of the current selection.
+let view = coin_selector.compute_view();
+assert!(!view.is_funded(), "we didn't select enough");
+println!("we didn't select enough yet we're missing: {}", view.missing());
 coin_selector.select(1);
-assert!(coin_selector.is_funded(), "we should have enough now");
+assert!(coin_selector.compute_view().is_funded(), "we should have enough now");
 
 // Now we need to know if we need a change output to drain the excess if we overshot too much
 //
@@ -69,7 +71,7 @@ assert!(coin_selector.is_funded(), "we should have enough now");
 let drain_weights = DrainWeights::TR_KEYSPEND; 
 // Our policy is to only add a change output if the value is over 1_000 sats
 let change_policy = ChangePolicy::min_value(drain_weights, 1_000);
-let change = coin_selector.drain(change_policy);
+let change = coin_selector.compute_view().drain(change_policy);
 if change.is_some() {
     println!("We need to add our change output to the transaction with {} value", change.value);
 } else {

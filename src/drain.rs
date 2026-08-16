@@ -70,11 +70,10 @@ impl DrainWeights {
 /// A drain (A.K.A. change) output.
 /// Technically it could represent multiple outputs.
 ///
-/// This is returned from [`CoinSelector::drain`] and [`SelectionView::drain`]. Note if `drain`
+/// This is returned from [`SelectionView::drain`]. Note if `drain`
 /// returns a drain where `is_none()` returns true then **no change should be added** to the
 /// transaction.
 ///
-/// [`CoinSelector::drain`]: crate::CoinSelector::drain
 /// [`SelectionView::drain`]: crate::SelectionView::drain
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Drain {
