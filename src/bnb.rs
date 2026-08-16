@@ -1,39 +1,4 @@
 use crate::{float::Ordf32, Drain, SelectionCache, SelectionView};
-
-/// Pass counts for iterative deepening, for measurement only.
-///
-/// `BnbIter` is `pub(crate)`, so a plain accessor would not be reachable from a benchmark harness.
-/// A process-global counter is enough: the harness runs one search at a time.
-pub mod deepening_stats {
-    use core::sync::atomic::{AtomicU64, Ordering};
-
-    static PASSES: AtomicU64 = AtomicU64::new(0);
-    static HANDOVER: AtomicU64 = AtomicU64::new(0);
-
-    pub(crate) fn record_pass() {
-        PASSES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Passes started since [`reset`]. One pass is one traversal from the root under one threshold.
-    pub fn passes() -> u64 {
-        PASSES.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn record_dive_handover(nodes: u64) {
-        HANDOVER.store(nodes, Ordering::Relaxed);
-    }
-
-    /// Nodes the opening dive spent before handing over to deepening. 0 means it never handed over.
-    pub fn dive_handover() -> u64 {
-        HANDOVER.load(Ordering::Relaxed)
-    }
-
-    pub fn reset() {
-        PASSES.store(0, Ordering::Relaxed);
-        HANDOVER.store(0, Ordering::Relaxed);
-    }
-}
-
 use super::CoinSelector;
 use alloc::vec::Vec;
 
@@ -358,7 +323,6 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         self.diving = false;
         self.reset_to_root();
         self.threshold = self.bound_of_current();
-        crate::bnb::deepening_stats::record_dive_handover(self.nodes);
     }
 
     /// Raise the threshold and restart from the root. `false` means the search is over.
@@ -391,8 +355,10 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             None => next,
         };
         self.threshold = Some(grown);
-        crate::bnb::deepening_stats::record_pass();
-        self.reset_to_root();
+        // No `reset_to_root` here: this runs only once `backtrack_to_next_branch` has popped every
+        // frame, so the selector is already back at the root. `stop_diving` is the caller that
+        // needs it, because it interrupts a dive mid-descent.
+        debug_assert!(self.stack.is_empty(), "a pass ended without unwinding its stack");
         true
     }
 

@@ -1028,3 +1028,68 @@ proptest! {
     }
 
 }
+
+/// Deepening escapes a dive the candidate order misleads, which is why it is the default.
+///
+/// Two groups, each a fat underpaying root spent by one tip that overpays and one that underpays.
+/// Coins on the same root **share** its bump, so what a coin costs depends on which others are
+/// already selected — and value-per-weight, the order the dive descends in, cannot see that at all.
+/// The dive commits to spreading across both roots and then prunes against that incumbent for the
+/// rest of its budget.
+///
+/// This is the in-tree version of what the external 42-fixture benchmark measures, and a regression
+/// guard on the *reason* deepening is on by default rather than on any particular round count.
+#[test]
+fn deepening_escapes_a_dive_that_the_candidate_order_misleads() {
+    let mut ancestors = Vec::new();
+    let mut tips: Vec<&'static str> = Vec::new();
+    for (root, rich, poor) in [("root0", "rich0", "poor0"), ("root1", "rich1", "poor1")] {
+        // The root is fat and pays almost nothing, so the whole group needs bumping even though
+        // the rich tip pays well over the target rate on its own.
+        ancestors.push(ancestor(root, 8_000, 500, vec![]));
+        ancestors.push(ancestor(rich, 1_200, 1_200 * 10, vec![root]));
+        ancestors.push(ancestor(poor, 1_200, 100, vec![root]));
+        tips.push(rich);
+        tips.push(poor);
+    }
+
+    let mut inputs = Vec::new();
+    for k in 0..10u64 {
+        inputs.push(input(100_000 - k * 300, tips[k as usize % tips.len()]));
+    }
+    for k in 0..10u64 {
+        inputs.push(input(97_000 - k * 300, CONFIRMED));
+    }
+    let total: u64 = inputs.iter().map(|i| i.value).sum();
+    let problem = SelectionProblem::new(target(10.0, total * 60 / 100), inputs, ancestors);
+
+    const BUDGET: usize = 600;
+    let score_of = |mut iter: Box<dyn Iterator<Item = Option<(CoinSelector, Ordf32)>> + '_>| {
+        iter.by_ref()
+            .take(BUDGET)
+            .flatten()
+            .last()
+            .expect("the greedy seed always scores")
+            .1
+    };
+
+    let dive_cs = problem.selector();
+    let dive = score_of(Box::new(dive_cs.bnb_solutions_dive_only(metric())));
+    let hybrid_cs = problem.selector();
+    let hybrid = score_of(Box::new(hybrid_cs.bnb_solutions(metric())));
+
+    assert!(
+        hybrid < dive,
+        "deepening should beat the plain dive on the shape it exists for: dive={} hybrid={}",
+        dive,
+        hybrid,
+    );
+    // Guard the size of the win, not the round count: a change that keeps deepening enabled but
+    // makes it converge later would otherwise pass silently.
+    let gain = (dive.0 - hybrid.0) / dive.0;
+    assert!(
+        gain > 0.05,
+        "the win shrank to {:.1}%, which is small enough to be worth re-justifying the default",
+        gain * 100.0,
+    );
+}
