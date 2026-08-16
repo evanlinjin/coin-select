@@ -118,6 +118,53 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             self.best = Some(score);
             self.seed = Some(seed);
         }
+        self.seed_ancestry_aware_incumbent();
+    }
+
+    /// Take a second greedy prefix in descending `(value - own bump) / weight` order, and keep it if
+    /// it scores better than the first.
+    ///
+    /// The search order is `value / weight`, which cannot see ancestry at all: a candidate whose
+    /// unconfirmed parents cost more to bump than the next candidate is worth still sorts ahead of
+    /// it. That is invisible on a pool the search can work through, because the search fixes it. On
+    /// a pool it cannot — where it returns the prefix it started from — the ordering *is* the
+    /// answer, and the blind one drags in parents it did not have to.
+    ///
+    /// So this pass reprices each candidate by what its own parents would cost, and takes the prefix
+    /// in that order instead. `local_bump` overcounts a shared parent that some other selected
+    /// candidate would have dragged in anyway, which is why the result is an incumbent and not the
+    /// order the search runs in: the ordering the bound relies on is untouched, and the reordered
+    /// prefix is adopted only when the metric scores it better.
+    fn seed_ancestry_aware_incumbent(&mut self) {
+        let problem = self.selector.problem();
+        // With no unconfirmed ancestors every bump is zero, so this is the prefix already taken.
+        if !problem.has_ancestors() {
+            return;
+        }
+
+        // Keyed once per candidate rather than inside the comparator: `local_bump` walks a
+        // candidate's ancestor set, and a sort would ask for it O(n log n) times.
+        let keys = problem
+            .candidates()
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let repriced = candidate.value.saturating_sub(problem.local_bump(index));
+                core::cmp::Reverse((Ordf32(repriced as f32 / candidate.weight as f32), repriced))
+            })
+            .collect::<Vec<_>>();
+
+        let mut seed = self.selector.clone();
+        seed.sort_candidates_by_key(|(index, _)| keys[index]);
+        if seed.select_until_target_met().is_err() {
+            return;
+        }
+        if let Some(score) = self.metric.score(&seed.compute_view()) {
+            if self.best.map_or(true, |best| score < best) {
+                self.best = Some(score);
+                self.seed = Some(seed);
+            }
+        }
     }
 
     fn is_exclusion_node(&self) -> bool {
