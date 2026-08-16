@@ -1,5 +1,28 @@
 use crate::{float::Ordf32, Drain, SelectionCache, SelectionView};
 
+/// Pass counts for iterative deepening, for measurement only.
+///
+/// `BnbIter` is `pub(crate)`, so a plain accessor would not be reachable from a benchmark harness.
+/// A process-global counter is enough: the harness runs one search at a time.
+pub mod deepening_stats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static PASSES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_pass() {
+        PASSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Passes started since [`reset`]. One pass is one traversal from the root under one threshold.
+    pub fn passes() -> u64 {
+        PASSES.load(Ordering::Relaxed)
+    }
+
+    pub fn reset() {
+        PASSES.store(0, Ordering::Relaxed);
+    }
+}
+
 use super::CoinSelector;
 use alloc::vec::Vec;
 
@@ -16,6 +39,17 @@ pub(crate) struct BnbIter<'a, M: BnbMetric> {
     /// [`seed_greedy_incumbent`](BnbIter::seed_greedy_incumbent).
     seed: Option<CoinSelector<'a>>,
     exhausted: bool,
+    /// Iterative deepening: the current pass's ceiling on the bound. `None` disables deepening
+    /// entirely, which is the traversal exactly as it was before.
+    threshold: Option<Ordf32>,
+    /// Smallest bound rejected *by the threshold* this pass — the next pass's floor.
+    ///
+    /// Children rejected for being no better than the incumbent are deliberately not recorded:
+    /// they can never become interesting, and folding them in would waste passes.
+    next_threshold: Option<Ordf32>,
+    /// Relative step for the threshold schedule. The schedule is a speed knob, never a correctness
+    /// one: raising the threshold past the next rejected bound only ever *adds* nodes to a pass.
+    deepening: Option<f32>,
     /// The `BnBMetric` that will score each selection
     pub(crate) metric: M,
 }
@@ -65,7 +99,7 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
             None
         };
 
-        if !self.descend() && !self.backtrack_to_next_branch() {
+        if !self.descend() && !self.backtrack_to_next_branch() && !self.start_next_pass() {
             self.exhausted = true;
         }
 
@@ -74,7 +108,15 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
 }
 
 impl<'a, M: BnbMetric> BnbIter<'a, M> {
-    pub(crate) fn new(mut selector: CoinSelector<'a>, metric: M) -> Self {
+    pub(crate) fn new(selector: CoinSelector<'a>, metric: M) -> Self {
+        Self::with_deepening(selector, metric, None)
+    }
+
+    pub(crate) fn with_deepening(
+        mut selector: CoinSelector<'a>,
+        metric: M,
+        deepening: Option<f32>,
+    ) -> Self {
         if metric.requires_ordering_by_descending_value_pwu() {
             selector.sort_candidates_by_descending_value_pwu();
         }
@@ -87,13 +129,22 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             best: None,
             seed: None,
             exhausted: false,
+            threshold: None,
+            next_threshold: None,
+            deepening,
             metric,
         };
 
         iter.seed_greedy_incumbent();
 
+        // Incumbent-only: the root must not be rejected by a threshold that is derived from it.
         if !iter.bound_is_promising() {
             iter.exhausted = true;
+        }
+
+        // The first pass admits exactly the root.
+        if deepening.is_some() {
+            iter.threshold = iter.bound_of_current();
         }
 
         iter
@@ -153,9 +204,78 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         }
     }
 
+    /// Whether to descend into a child, and the place the deepening threshold is applied.
+    ///
+    /// Takes `&mut self` because a child rejected by the threshold contributes the next pass's
+    /// floor. Rejection by the incumbent contributes nothing.
+    fn admit(&mut self, bound: Option<Ordf32>) -> bool {
+        if !self.is_promising(bound) {
+            return false;
+        }
+        let bound = match bound {
+            Some(bound) => bound,
+            None => return false,
+        };
+        if let Some(threshold) = self.threshold {
+            if bound > threshold {
+                self.next_threshold = Some(match self.next_threshold {
+                    Some(next) if next <= bound => next,
+                    _ => bound,
+                });
+                return false;
+            }
+        }
+        true
+    }
+
     fn bound_is_promising(&mut self) -> bool {
         let bound = self.bound_of_current();
-        self.is_promising(bound)
+        self.admit(bound)
+    }
+
+    /// Unwind every frame, leaving the selector and cache as they were at the root.
+    ///
+    /// In place, using the same undo paths backtracking uses — rebuilding the `CoinSelector` or the
+    /// `SelectionCache` per pass is what would put the memory back.
+    fn reset_to_root(&mut self) {
+        while let Some(frame) = self.stack.pop() {
+            if frame.is_inclusion {
+                self.undo_include(frame.index);
+            } else {
+                self.undo_exclude(&frame.banned);
+            }
+        }
+    }
+
+    /// Raise the threshold and restart from the root. `false` means the search is over.
+    fn start_next_pass(&mut self) -> bool {
+        let eps = match self.deepening {
+            Some(eps) => eps,
+            None => return false,
+        };
+        // The incumbent is proven optimal: every node that could beat it had a bound at or below
+        // the threshold, so it was visited this pass or an earlier one.
+        if let (Some(best), Some(threshold)) = (self.best, self.threshold) {
+            if best <= threshold {
+                return false;
+            }
+        }
+        // Nothing was rejected by the threshold, so the whole tree is explored.
+        let next = match self.next_threshold.take() {
+            Some(next) => next,
+            None => return false,
+        };
+        let grown = match self.threshold {
+            Some(threshold) => {
+                let stepped = threshold.0 * (1.0 + eps);
+                Ordf32(if stepped > next.0 { stepped } else { next.0 })
+            }
+            None => next,
+        };
+        self.threshold = Some(grown);
+        crate::bnb::deepening_stats::record_pass();
+        self.reset_to_root();
+        true
     }
 
     fn cursor(&self) -> usize {
@@ -272,13 +392,13 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
 
         self.apply_include(index);
         let inc_bound = self.bound_of_current();
-        let inc_ok = self.is_promising(inc_bound);
+        let inc_ok = self.admit(inc_bound);
         self.undo_include(index);
 
         let (banned, exc_next_cursor) = self.exclusion_plan(index, cursor);
         self.apply_exclude(&banned);
         let exc_bound = self.bound_of_current();
-        let exc_ok = self.is_promising(exc_bound);
+        let exc_ok = self.admit(exc_bound);
         self.undo_exclude(&banned);
 
         // println!(

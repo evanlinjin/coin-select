@@ -440,6 +440,20 @@ impl<'a> CoinSelector<'a> {
         crate::bnb::BnbIter::new(self.clone(), metric)
     }
 
+    /// [`bnb_solutions`](Self::bnb_solutions), searched with iterative deepening on the bound.
+    ///
+    /// The traversal stays depth-first and so stays linear in memory, but it runs in passes under a
+    /// rising ceiling on the bound, which recovers the node ordering a priority queue would give.
+    /// `eps` is the relative step between thresholds: smaller follows the queue's order more
+    /// closely and re-expands more, larger degenerates toward a plain dive.
+    pub fn bnb_solutions_with_deepening<M: BnbMetric>(
+        &self,
+        metric: M,
+        eps: f32,
+    ) -> impl Iterator<Item = Option<(CoinSelector<'a>, Ordf32)>> {
+        crate::bnb::BnbIter::with_deepening(self.clone(), metric, Some(eps))
+    }
+
     /// Run branch and bound to minimize the score of the provided [`BnbMetric`].
     ///
     /// The method keeps trying until no better solution can be found, or we reach `max_rounds`. If a
