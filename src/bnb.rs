@@ -11,9 +11,10 @@ pub(crate) struct BnbIter<'a, M: BnbMetric> {
     cache: SelectionCache,
     stack: Vec<Frame>,
     best: Option<Ordf32>,
-    /// The greedy selection, yielded before the first node is expanded. See
+    /// The greedy selection, yielded before the first node is expanded. Its score is `best`:
+    /// nothing else can have run yet, so the two are set together. See
     /// [`seed_greedy_incumbent`](BnbIter::seed_greedy_incumbent).
-    seed: Option<(CoinSelector<'a>, Ordf32)>,
+    seed: Option<CoinSelector<'a>>,
     exhausted: bool,
     /// The `BnBMetric` that will score each selection
     pub(crate) metric: M,
@@ -34,7 +35,8 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(seed) = self.seed.take() {
-            return Some(Some(seed));
+            let score = self.best.expect("the seed and `best` are set together");
+            return Some(Some((seed, score)));
         }
 
         if self.exhausted {
@@ -114,7 +116,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         }
         if let Some(score) = self.metric.score(&seed.compute_view()) {
             self.best = Some(score);
-            self.seed = Some((seed, score));
+            self.seed = Some(seed);
         }
     }
 
