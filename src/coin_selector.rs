@@ -144,7 +144,8 @@ impl<'a> CoinSelector<'a> {
         let mut union = Bitset::with_capacity(self.problem.ancestors().len());
         if self.problem.has_ancestors() {
             for cand_index in self.selected.iter() {
-                for anc_index in self.problem.drags_in(cand_index).iter() {
+                for &anc_index in self.problem.drags_in(cand_index) {
+                    let anc_index = anc_index as usize;
                     union.insert(anc_index);
                 }
             }
@@ -161,7 +162,8 @@ impl<'a> CoinSelector<'a> {
         if self.problem.has_ancestors() {
             let already = self.selected_ancestors();
             for cand_index in self.unselected_indices() {
-                for anc_index in self.problem.drags_in(cand_index).iter() {
+                for &anc_index in self.problem.drags_in(cand_index) {
+                    let anc_index = anc_index as usize;
                     if !already.contains(anc_index) {
                         union.insert(anc_index);
                     }

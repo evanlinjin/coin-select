@@ -72,7 +72,7 @@ pub struct SelectionProblem {
     ///
     /// Empty when the problem has no ancestors (see [`has_ancestors`](Self::has_ancestors)); use
     /// [`drags_in`](Self::drags_in) rather than indexing this directly.
-    drags_in: Vec<Bitset>,
+    drags_in: AncestorSets,
     /// Summed weight and fee of the ancestors *only* this candidate can drag in.
     ///
     /// No other candidate reaches them, so they arrive exactly when this candidate is selected.
@@ -82,20 +82,67 @@ pub struct SelectionProblem {
     private: Vec<(u64, u64)>,
     /// [`drags_in`](Self::drags_in) restricted to ancestors reachable via several candidates, which
     /// are the only ones that still need de-duplicating at selection time.
-    shared_drags_in: Vec<Bitset>,
+    shared_drags_in: AncestorSets,
     /// Whether any ancestor is reachable via exactly one candidate.
     has_private_ancestors: bool,
     /// Whether any ancestor is reachable via more than one candidate.
     has_shared_ancestors: bool,
 }
 
+/// Per-candidate sets of ancestor indices, stored flat.
+///
+/// A candidate drags in its residing transactions and their unconfirmed parents — a handful of
+/// entries however large the pool is. Storing that as one dense bitset per candidate costs
+/// candidates x ancestors bits, which on a 200,000-candidate pool with 26,666 ancestors is 667 MB
+/// of very nearly nothing: the sets measure 0.002% full. Flat storage costs the entries themselves.
+///
+/// Every read is a full walk of one candidate's set, and the sets never change after construction,
+/// so a slice is all this has to be.
+#[derive(Debug, Clone)]
+struct AncestorSets {
+    /// Every candidate's ancestor indices, concatenated, each candidate's run sorted.
+    indices: Vec<u32>,
+    /// `offsets[i]..offsets[i + 1]` bounds candidate `i`. Length is candidate count plus one.
+    offsets: Vec<u32>,
+}
+
+impl AncestorSets {
+    fn empty(candidates: usize) -> Self {
+        Self {
+            indices: Vec::new(),
+            offsets: alloc::vec![0; candidates + 1],
+        }
+    }
+
+    fn with_capacity(candidates: usize) -> Self {
+        let mut offsets = Vec::with_capacity(candidates + 1);
+        offsets.push(0);
+        Self {
+            indices: Vec::new(),
+            offsets,
+        }
+    }
+
+    /// Append one candidate's set. Callers push in candidate order.
+    fn push(&mut self, set: impl IntoIterator<Item = u32>) {
+        self.indices.extend(set);
+        self.offsets.push(self.indices.len() as u32);
+    }
+
+    fn get(&self, index: usize) -> &[u32] {
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        &self.indices[start..end]
+    }
+}
+
 /// The fee still owed so the ancestors in `set` meet `rate`, over the whole set at once.
 ///
 /// Weights and fees are netted across the set, so an overpaying ancestor subsidizes an underpaying
 /// one and the result saturates at 0 (the child is never credited).
-fn bump_of(ancestors: &[(u64, u64)], rate: FeeRate, set: &Bitset) -> u64 {
-    let (weight, fee) = set.iter().fold((0_u64, 0_u64), |(w, f), anc_i| {
-        let (anc_w, anc_f) = ancestors[anc_i];
+fn bump_of(ancestors: &[(u64, u64)], rate: FeeRate, set: &[u32]) -> u64 {
+    let (weight, fee) = set.iter().fold((0_u64, 0_u64), |(w, f), &anc_i| {
+        let (anc_w, anc_f) = ancestors[anc_i as usize];
         (w + anc_w, f + anc_f)
     });
     rate.implied_fee_wu(weight).saturating_sub(fee)
@@ -115,9 +162,9 @@ impl SelectionProblem {
             target,
             candidates,
             ancestors: Vec::new(),
-            drags_in: (0..n).map(|_| Bitset::with_capacity(0)).collect(),
+            drags_in: AncestorSets::empty(n),
             private: alloc::vec![(0, 0); n],
-            shared_drags_in: (0..n).map(|_| Bitset::with_capacity(0)).collect(),
+            shared_drags_in: AncestorSets::empty(n),
             has_private_ancestors: false,
             has_shared_ancestors: false,
         }
@@ -153,7 +200,11 @@ impl SelectionProblem {
         let n_anc = ancestors.len();
         let anc_weight_fee: Vec<(u64, u64)> = ancestors.iter().map(|a| (a.weight, a.fee)).collect();
         let mut candidates = Vec::new();
-        let mut drags_in = Vec::new();
+        let mut drags_in = AncestorSets::with_capacity(0);
+        // One scratch set, reused and emptied per candidate: allocating a dense one per candidate
+        // is the cost this layout exists to avoid, so it must not reappear during construction.
+        let mut scratch = Bitset::with_capacity(n_anc);
+        let mut dragged: Vec<u32> = Vec::new();
 
         for input_group in input_groups {
             let mut cand = Candidate {
@@ -162,7 +213,7 @@ impl SelectionProblem {
                 segwit_count: 0,
                 legacy_count: 0,
             };
-            let mut dragged = Bitset::with_capacity(n_anc);
+            dragged.clear();
 
             for input in input_group.into() {
                 cand.value += input.value;
@@ -175,46 +226,51 @@ impl SelectionProblem {
                 let mut txid_stack = alloc::vec![input.residing_txid];
                 while let Some(txid) = txid_stack.pop() {
                     if let Some(&anc_i) = txid_to_anc.get(&txid) {
-                        if dragged.insert(anc_i) {
+                        if scratch.insert(anc_i) {
+                            dragged.push(anc_i as u32);
                             txid_stack.extend(ancestors[anc_i].parents.iter().copied());
                         }
                     }
                 }
             }
 
+            for &anc_i in &dragged {
+                scratch.remove(anc_i as usize);
+            }
+            dragged.sort_unstable();
             candidates.push(cand);
-            drags_in.push(dragged);
+            drags_in.push(dragged.iter().copied());
         }
 
         // An ancestor no other candidate can reach arrives exactly when this one is selected, so its
         // weight and fee can be folded into the candidate now. The rest still have to be
         // de-duplicated at selection time.
         let mut reachable_by = alloc::vec![0_u32; n_anc];
-        for dragged in &drags_in {
-            for anc_i in dragged.iter() {
-                reachable_by[anc_i] += 1;
-            }
+        for &anc_i in &drags_in.indices {
+            reachable_by[anc_i as usize] += 1;
         }
-        let mut private = Vec::with_capacity(drags_in.len());
-        let mut shared_drags_in = Vec::with_capacity(drags_in.len());
+        let n_cand = candidates.len();
+        let mut private = Vec::with_capacity(n_cand);
+        let mut shared_drags_in = AncestorSets::with_capacity(n_cand);
         let mut has_private_ancestors = false;
         let mut has_shared_ancestors = false;
-        for dragged in &drags_in {
+        let mut shared: Vec<u32> = Vec::new();
+        for index in 0..n_cand {
             let mut private_weight_fee = (0_u64, 0_u64);
-            let mut shared = Bitset::with_capacity(n_anc);
-            for anc_i in dragged.iter() {
-                if reachable_by[anc_i] == 1 {
-                    let (weight, fee) = anc_weight_fee[anc_i];
+            shared.clear();
+            for &anc_i in drags_in.get(index) {
+                if reachable_by[anc_i as usize] == 1 {
+                    let (weight, fee) = anc_weight_fee[anc_i as usize];
                     private_weight_fee.0 += weight;
                     private_weight_fee.1 += fee;
                     has_private_ancestors = true;
                 } else {
-                    shared.insert(anc_i);
+                    shared.push(anc_i);
                     has_shared_ancestors = true;
                 }
             }
             private.push(private_weight_fee);
-            shared_drags_in.push(shared);
+            shared_drags_in.push(shared.iter().copied());
         }
 
         Self {
@@ -270,8 +326,8 @@ impl SelectionProblem {
     }
 
     /// Ancestor indices dragged in by selecting candidate `index`.
-    pub fn drags_in(&self, index: usize) -> &Bitset {
-        &self.drags_in[index]
+    pub fn drags_in(&self, index: usize) -> &[u32] {
+        self.drags_in.get(index)
     }
 
     /// Summed `(weight, fee)` of the ancestors only candidate `index` can drag in.
@@ -288,8 +344,8 @@ impl SelectionProblem {
     /// Those are the only ones that can be dragged in twice over, so they are the only ones a
     /// selection has to de-duplicate; the rest are folded into
     /// [`private_ancestors`](Self::private_ancestors).
-    pub fn shared_drags_in(&self, index: usize) -> &Bitset {
-        &self.shared_drags_in[index]
+    pub fn shared_drags_in(&self, index: usize) -> &[u32] {
+        self.shared_drags_in.get(index)
     }
 
     /// Whether any ancestor is reachable via exactly one candidate.
@@ -409,8 +465,8 @@ mod tests {
         }];
         let p = SelectionProblem::new(target(10.0), inputs, ancestors);
         assert_eq!(p.len(), 1);
-        let dragged: Vec<_> = p.drags_in(0).iter().collect();
-        assert_eq!(dragged, vec![0, 1, 2]); // A, B, C
+        let dragged: Vec<u32> = p.drags_in(0).to_vec();
+        assert_eq!(dragged, vec![0_u32, 1, 2]); // A, B, C
     }
 
     #[test]
@@ -436,8 +492,8 @@ mod tests {
             },
         ];
         let p = SelectionProblem::new(target(10.0), inputs, ancestors);
-        assert!(p.drags_in(0).contains(0));
-        assert!(p.drags_in(1).contains(0));
+        assert!(p.drags_in(0).contains(&0));
+        assert!(p.drags_in(1).contains(&0));
         assert_eq!(p.local_bump(0), p.local_bump(1));
         assert!(p.local_bump(0) > 0);
     }
@@ -476,7 +532,7 @@ mod tests {
             residing_txid: "child",
         }];
         let p = SelectionProblem::new(target(10.0), inputs, ancestors);
-        let dragged: Vec<_> = p.drags_in(0).iter().collect();
-        assert_eq!(dragged, vec![0]); // only child
+        let dragged: Vec<u32> = p.drags_in(0).to_vec();
+        assert_eq!(dragged, vec![0_u32]); // only child
     }
 }

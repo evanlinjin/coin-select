@@ -514,17 +514,17 @@ fn ancestors_are_split_into_private_and_shared() {
     assert_eq!(problem.private_ancestors(1), (0, 0));
     assert_eq!(problem.private_ancestors(2), (0, 0));
     assert_eq!(
-        problem.shared_drags_in(1).iter().collect::<Vec<_>>(),
-        vec![1]
+        problem.shared_drags_in(1),
+        &[1_u32]
     );
     assert_eq!(
-        problem.shared_drags_in(2).iter().collect::<Vec<_>>(),
-        vec![1]
+        problem.shared_drags_in(2),
+        &[1_u32]
     );
 
     // Either way `drags_in` still describes the full truth.
-    assert_eq!(problem.drags_in(0).iter().collect::<Vec<_>>(), vec![0]);
-    assert_eq!(problem.drags_in(1).iter().collect::<Vec<_>>(), vec![1]);
+    assert_eq!(problem.drags_in(0), &[0_u32]);
+    assert_eq!(problem.drags_in(1), &[1_u32]);
 
     // And a problem where nothing is shared says so, which is what lets the bump skip
     // de-duplication entirely.
@@ -888,7 +888,7 @@ fn spec_strategy() -> impl Strategy<Value = AncestorProblemSpec> {
 fn expected_bump(problem: &SelectionProblem, cs: &CoinSelector<'_>, feerate: FeeRate) -> u64 {
     let mut union = std::collections::BTreeSet::new();
     for i in cs.selected_indices().iter() {
-        union.extend(problem.drags_in(i).iter());
+        union.extend(problem.drags_in(i).iter().map(|&a| a as usize));
     }
     let (weight, fee) = union
         .iter()

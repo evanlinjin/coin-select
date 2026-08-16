@@ -122,7 +122,8 @@ impl SelectionCache {
                 Self::ancestor_surplus(problem, problem.private_ancestors(index));
         }
         if problem.has_shared_ancestors() {
-            for ancestor in problem.shared_drags_in(index).iter() {
+            for &ancestor in problem.shared_drags_in(index) {
+                let ancestor = ancestor as usize;
                 if self.shared_reachable_refcounts[ancestor] == 0
                     && self.shared_refcounts[ancestor] == 0
                 {
@@ -151,7 +152,8 @@ impl SelectionCache {
                 Self::ancestor_surplus(problem, problem.private_ancestors(index));
         }
         if problem.has_shared_ancestors() {
-            for ancestor in problem.shared_drags_in(index).iter() {
+            for &ancestor in problem.shared_drags_in(index) {
+                let ancestor = ancestor as usize;
                 self.shared_reachable_refcounts[ancestor] -= 1;
                 if self.shared_reachable_refcounts[ancestor] == 0
                     && self.shared_refcounts[ancestor] == 0
@@ -196,7 +198,8 @@ impl SelectionCache {
             self.private_fee += fee;
         }
         if problem.has_shared_ancestors() {
-            for ancestor in problem.shared_drags_in(index).iter() {
+            for &ancestor in problem.shared_drags_in(index) {
+                let ancestor = ancestor as usize;
                 if self.shared_refcounts[ancestor] == 0 {
                     let (weight, fee) = problem.ancestors()[ancestor];
                     self.shared_weight += weight;
@@ -232,7 +235,8 @@ impl SelectionCache {
             self.private_fee -= fee;
         }
         if problem.has_shared_ancestors() {
-            for ancestor in problem.shared_drags_in(index).iter() {
+            for &ancestor in problem.shared_drags_in(index) {
+                let ancestor = ancestor as usize;
                 self.shared_refcounts[ancestor] -= 1;
                 if self.shared_refcounts[ancestor] == 0 {
                     let (weight, fee) = problem.ancestors()[ancestor];
