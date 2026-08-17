@@ -1093,3 +1093,73 @@ fn deepening_escapes_a_dive_that_the_candidate_order_misleads() {
         gain * 100.0,
     );
 }
+
+/// The one thing no candidate sort key can say: a coin is cheap only because another selected coin
+/// already pays for its parent.
+///
+/// Here `A` and `B` share `P`, while `C` is alone on `Q`. A selection of `{A, C}` pays both bumps.
+/// Swapping `C` for `B` keeps the same total value and drops `Q` entirely — but no fixed order over
+/// individual coins can prefer `B` to `C`, because they are identical until `A` is selected.
+/// `repair` is what closes that, so this is the case it exists for.
+#[test]
+fn repair_drops_a_coin_that_pays_for_an_ancestor_alone() {
+    let t = target(10.0, 100_000);
+    let problem = SelectionProblem::new(
+        t,
+        [
+            input(80_000, "P"),       // 0: A
+            input(80_000, "P"),       // 1: B, indistinguishable from A on any per-coin key
+            input(80_000, "Q"),       // 2: C, the only candidate that can drag in Q
+            input(20_000, CONFIRMED), // 3: D, too small to fund the target in anyone's place
+        ],
+        [
+            ancestor("P", 4_000, 0, vec![]),
+            ancestor("Q", 4_000, 0, vec![]),
+        ],
+    );
+    assert!(problem.has_shared_ancestors(), "P is reachable from both A and B");
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    cs.select(2);
+    let before = metric().score(&cs.compute_view()).expect("{A, C} is funded");
+    assert_eq!(cs.compute_view().ancestor_bump(), 20_000, "P and Q both charged");
+
+    let after = cs.repair(&mut metric(), 100).expect("C can be swapped for B");
+
+    assert!(after < before, "{} is not an improvement on {}", after, before);
+    assert!(!cs.is_selected(2), "C still holds Q alone");
+    assert!(cs.is_selected(1), "B is the replacement: same value, and P is already paid for");
+    assert_eq!(cs.compute_view().ancestor_bump(), 10_000, "Q is gone, P charged once");
+    assert_eq!(
+        before.0 - after.0,
+        10_000.0,
+        "the whole improvement is the bump that stopped being owed",
+    );
+}
+
+/// With every ancestor reachable from one candidate there is nothing set-dependent for the order to
+/// have got wrong, so the pass is a pure cost and declines to run.
+#[test]
+fn repair_declines_when_no_ancestor_is_shared() {
+    let t = target(10.0, 100_000);
+    let problem = SelectionProblem::new(
+        t,
+        [
+            input(80_000, "P"),
+            input(80_000, "Q"),
+            input(79_000, CONFIRMED),
+        ],
+        [
+            ancestor("P", 4_000, 0, vec![]),
+            ancestor("Q", 4_000, 0, vec![]),
+        ],
+    );
+    assert!(!problem.has_shared_ancestors());
+
+    let mut cs = problem.selector();
+    cs.select(0);
+    cs.select(1);
+    assert!(cs.repair(&mut metric(), 100).is_none());
+    assert!(cs.is_selected(0) && cs.is_selected(1), "the selection is untouched");
+}
