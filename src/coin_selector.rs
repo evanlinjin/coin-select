@@ -454,12 +454,109 @@ impl<'a> CoinSelector<'a> {
     ///
     /// Most callers should use [`CoinSelector::run_bnb`] instead, especially when they need the
     /// change output selected by the metric.
+    /// On a problem with unconfirmed ancestors this dives and then deepens on the bound (see
+    /// [`bnb_solutions_hybrid`](Self::bnb_solutions_hybrid)); otherwise it is a plain depth-first
+    /// dive, which is what [`bnb_solutions_dive_only`](Self::bnb_solutions_dive_only) always gives.
+    ///
+    /// The gate is not a tuning choice, it is where the problem being solved exists. Deepening is
+    /// there to escape a dive that stalled because the candidate order — value per weight — cannot
+    /// see what a coin's unconfirmed parents cost to bump. With no ancestors there is no such
+    /// blindness, the dive does not stall, and paying to re-expand from the root is a straight loss:
+    /// measured over 4,000 random ancestor-free pools it is worse on 54 and better on 1.
     pub fn bnb_solutions<M: BnbMetric>(
+        &self,
+        metric: M,
+    ) -> impl Iterator<Item = Option<(CoinSelector<'a>, Ordf32)>> {
+        self.default_bnb_iter(metric)
+    }
+
+    /// The iterator [`bnb_solutions`](Self::bnb_solutions) and [`run_bnb`](Self::run_bnb) share.
+    ///
+    /// `run_bnb` needs the concrete type to reach the metric for its drain, so the choice of
+    /// traversal lives here rather than being made twice.
+    pub(crate) fn default_bnb_iter<M: BnbMetric>(&self, metric: M) -> crate::bnb::BnbIter<'a, M> {
+        let deepen = self.problem.has_ancestors();
+        crate::bnb::BnbIter::configured(
+            self.clone(),
+            metric,
+            if deepen { Some(Self::DEFAULT_DEEPENING_EPS) } else { None },
+            if deepen {
+                Some(
+                    Self::DEFAULT_DIVE_FLOOR_PER_CANDIDATE
+                        .saturating_mul(self.candidates().count() as u64),
+                )
+            } else {
+                None
+            },
+        )
+    }
+
+    /// [`bnb_solutions`](Self::bnb_solutions) as a plain depth-first dive, with no deepening.
+    pub fn bnb_solutions_dive_only<M: BnbMetric>(
         &self,
         metric: M,
     ) -> impl Iterator<Item = Option<(CoinSelector<'a>, Ordf32)>> {
         crate::bnb::BnbIter::new(self.clone(), metric)
     }
+
+    /// Relative step between deepening thresholds.
+    ///
+    /// A strict schedule — one pass per distinct bound — costs up to 194x more nodes on the
+    /// fixtures that already match a priority queue node for node, because they pay for
+    /// re-expansion and buy nothing. 0.1 holds that overhead near 1.5x while collapsing the pass
+    /// count to single digits.
+    pub const DEFAULT_DEEPENING_EPS: f32 = 0.1;
+
+    /// [`bnb_solutions`](Self::bnb_solutions), dived first and then deepened, with both knobs given.
+    ///
+    /// Depth-first reaches complete selections immediately but prunes against whatever its dive
+    /// order found; deepening recovers a priority queue's node ordering but reaches complete
+    /// selections late. This takes both: dive until the incumbent stops improving, then deepen from
+    /// the root keeping that incumbent.
+    ///
+    /// Note what that does *not* promise. Against a dive stopped at the same handover point the
+    /// incumbent only improves, so the hybrid cannot be worse. Against a dive that keeps spending
+    /// the whole budget on descending, it can be: the rounds spent re-expanding from the root are
+    /// rounds the dive would have spent going deeper. On pools with no unconfirmed ancestors, where
+    /// the dive has no ordering pathology to escape, that trade is a loss — which is why
+    /// [`bnb_solutions`](Self::bnb_solutions) only picks this when the problem has ancestors.
+    ///
+    /// `eps` is the relative step between deepening thresholds and `floor_per_candidate` is how long
+    /// the opening dive is protected; see [`DEFAULT_DEEPENING_EPS`](Self::DEFAULT_DEEPENING_EPS) and
+    /// [`DEFAULT_DIVE_FLOOR_PER_CANDIDATE`](Self::DEFAULT_DIVE_FLOOR_PER_CANDIDATE).
+    pub fn bnb_solutions_hybrid<M: BnbMetric>(
+        &self,
+        metric: M,
+        eps: f32,
+        floor_per_candidate: u64,
+    ) -> impl Iterator<Item = Option<(CoinSelector<'a>, Ordf32)>> {
+        debug_assert!(eps > 0.0, "a non-positive `eps` silently buys the strict schedule");
+        let floor = floor_per_candidate.saturating_mul(self.candidates().count() as u64);
+        crate::bnb::BnbIter::configured(self.clone(), metric, Some(eps), Some(floor))
+    }
+
+    /// How long the opening dive is protected for, per candidate.
+    ///
+    /// The dive needs a floor or it hands over before it has found anything, because the greedy
+    /// incumbent is set before the first node and so leaves the "time since last improvement" rule
+    /// with nothing to measure against. The floor has to scale with something, and the budget is not
+    /// visible here — a caller may be spending rounds or wall clock. Candidate count is: a dive to a
+    /// leaf costs at most one node per candidate, so this is that depth times a constant.
+    ///
+    /// Swept over 42 fixtures at 0, 5, 20, 50 and 200, under a 100,000-round budget and at 3 ms,
+    /// 10 ms, 100 ms and 1000 ms of wall clock. 5 is the best worst case: 2.59% of total package fee
+    /// better than 50 at 3 ms and 0.28% better at 10 ms, against losing by under 0.1% at 100 ms and
+    /// 1000 ms. Dropping the floor to 0 — handing over before the dive completes a single selection
+    /// — costs 10.7%, so the floor is doing real work; it just does not need to be large.
+    ///
+    /// That the right value is small follows from what the dive is for. It only has to reach one
+    /// complete selection, which is one root-to-leaf path, so a few nodes per candidate is the
+    /// natural scale and anything beyond that is the dive refusing to hand over.
+    ///
+    /// This was 200 when the dive was measured against a node that cost several times more. The
+    /// floor is counted in nodes, so making nodes cheaper made the same floor a longer dive in wall
+    /// clock, and the tuning moved with it.
+    pub const DEFAULT_DIVE_FLOOR_PER_CANDIDATE: u64 = 5;
 
     /// Run branch and bound to minimize the score of the provided [`BnbMetric`].
     ///
@@ -473,7 +570,7 @@ impl<'a> CoinSelector<'a> {
         metric: M,
         max_rounds: usize,
     ) -> Result<(Ordf32, Drain), NoBnbSolution> {
-        let mut iter = crate::bnb::BnbIter::new(self.clone(), metric);
+        let mut iter = self.default_bnb_iter(metric);
         let mut rounds = 0_usize;
         let best = iter
             .by_ref()

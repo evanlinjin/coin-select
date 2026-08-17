@@ -102,6 +102,11 @@ fn bnb_finds_an_exact_solution_in_n_iter() {
         .last()
         .expect("it found a solution");
 
+    // Unchanged by deepening, and deliberately so: this problem has no unconfirmed ancestors, so
+    // `bnb_solutions` gates deepening off and dives. Deepening would in fact reach the same
+    // exact-value solution here in 2,970 rounds — but the gate is set by what happens under a
+    // *budget*, where re-expanding from the root costs a truncated ancestor-free search more than
+    // the better node order wins it.
     assert_eq!(rounds, 62453);
     assert_eq!(best.compute_view().input_weight(), solution_weight);
     assert_eq!(

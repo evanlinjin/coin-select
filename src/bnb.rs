@@ -1,5 +1,4 @@
 use crate::{float::Ordf32, Drain, SelectionCache, SelectionView};
-
 use super::CoinSelector;
 use alloc::vec::Vec;
 
@@ -16,6 +15,30 @@ pub(crate) struct BnbIter<'a, M: BnbMetric> {
     /// [`seed_greedy_incumbent`](BnbIter::seed_greedy_incumbent).
     seed: Option<CoinSelector<'a>>,
     exhausted: bool,
+    /// Iterative deepening: the current pass's ceiling on the bound. `None` disables deepening
+    /// entirely, which is the traversal exactly as it was before.
+    threshold: Option<Ordf32>,
+    /// Smallest bound rejected *by the threshold* this pass — the next pass's floor.
+    ///
+    /// Children rejected for being no better than the incumbent are deliberately not recorded:
+    /// they can never become interesting, and folding them in would waste passes.
+    next_threshold: Option<Ordf32>,
+    /// Relative step for the threshold schedule. The schedule is a speed knob, never a correctness
+    /// one: raising the threshold past the next rejected bound only ever *adds* nodes to a pass.
+    deepening: Option<f32>,
+    /// Still in the opening dive, before any threshold applies.
+    ///
+    /// Deepening reconstructs the queue's ordering but is not anytime: under a ceiling low enough to
+    /// be useful, the early passes may not reach a complete selection at all. On a pool too large to
+    /// exhaust that is strictly worse than diving, which reaches leaves immediately. So dive first,
+    /// and deepen only once the dive stops paying — the incumbent carries over, so the deepening
+    /// phase cannot return anything worse than the dive already found.
+    diving: bool,
+    /// Smallest number of nodes the opening dive is always given before it may hand over.
+    dive_floor: u64,
+    /// Nodes expanded so far, and the count when the incumbent last improved.
+    nodes: u64,
+    last_improvement: u64,
     /// The `BnBMetric` that will score each selection
     pub(crate) metric: M,
 }
@@ -43,6 +66,11 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
             return None;
         }
 
+        self.nodes += 1;
+        if self.diving && self.dive_is_stalled() {
+            self.stop_diving();
+        }
+
         // {
         //     println!("=========================== {:?}", self.best);
         //     println!("{} {:?}", &self.selector, self.bound_of_current());
@@ -65,7 +93,7 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
             None
         };
 
-        if !self.descend() && !self.backtrack_to_next_branch() {
+        if !self.descend() && !self.backtrack_to_next_branch() && !self.start_next_pass() {
             self.exhausted = true;
         }
 
@@ -74,7 +102,24 @@ impl<'a, M: BnbMetric> Iterator for BnbIter<'a, M> {
 }
 
 impl<'a, M: BnbMetric> BnbIter<'a, M> {
-    pub(crate) fn new(mut selector: CoinSelector<'a>, metric: M) -> Self {
+    pub(crate) fn new(selector: CoinSelector<'a>, metric: M) -> Self {
+        Self::with_deepening(selector, metric, None)
+    }
+
+    pub(crate) fn with_deepening(
+        selector: CoinSelector<'a>,
+        metric: M,
+        deepening: Option<f32>,
+    ) -> Self {
+        Self::configured(selector, metric, deepening, None)
+    }
+
+    pub(crate) fn configured(
+        mut selector: CoinSelector<'a>,
+        metric: M,
+        deepening: Option<f32>,
+        dive_first: Option<u64>,
+    ) -> Self {
         if metric.requires_ordering_by_descending_value_pwu() {
             selector.sort_candidates_by_descending_value_pwu();
         }
@@ -87,13 +132,26 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             best: None,
             seed: None,
             exhausted: false,
+            threshold: None,
+            next_threshold: None,
+            deepening,
+            diving: dive_first.is_some() && deepening.is_some(),
+            dive_floor: dive_first.unwrap_or(0),
+            nodes: 0,
+            last_improvement: 0,
             metric,
         };
 
         iter.seed_greedy_incumbent();
 
+        // Incumbent-only: the root must not be rejected by a threshold that is derived from it.
         if !iter.bound_is_promising() {
             iter.exhausted = true;
+        }
+
+        // The first pass admits exactly the root. A hybrid search sets this when it stops diving.
+        if deepening.is_some() && !iter.diving {
+            iter.threshold = iter.bound_of_current();
         }
 
         iter
@@ -180,6 +238,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         };
         if better {
             self.best = Some(score);
+            self.last_improvement = self.nodes;
             Some(score)
         } else {
             None
@@ -205,9 +264,102 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
         }
     }
 
+    /// Whether to descend into a child, and the place the deepening threshold is applied.
+    ///
+    /// Takes `&mut self` because a child rejected by the threshold contributes the next pass's
+    /// floor. Rejection by the incumbent contributes nothing.
+    fn admit(&mut self, bound: Option<Ordf32>) -> bool {
+        if !self.is_promising(bound) {
+            return false;
+        }
+        let bound = match bound {
+            Some(bound) => bound,
+            None => return false,
+        };
+        if let Some(threshold) = self.threshold {
+            if bound > threshold {
+                self.next_threshold = Some(match self.next_threshold {
+                    Some(next) if next <= bound => next,
+                    _ => bound,
+                });
+                return false;
+            }
+        }
+        true
+    }
+
     fn bound_is_promising(&mut self) -> bool {
         let bound = self.bound_of_current();
-        self.is_promising(bound)
+        self.admit(bound)
+    }
+
+    /// Unwind every frame, leaving the selector and cache as they were at the root.
+    ///
+    /// In place, using the same undo paths backtracking uses — rebuilding the `CoinSelector` or the
+    /// `SelectionCache` per pass is what would put the memory back.
+    fn reset_to_root(&mut self) {
+        while let Some(frame) = self.stack.pop() {
+            if frame.is_inclusion {
+                self.undo_include(frame.index);
+            } else {
+                self.undo_exclude(&frame.banned);
+            }
+        }
+    }
+
+    /// Whether the opening dive has stopped paying for itself.
+    ///
+    /// The rule is self-scaling rather than a tuned constant: give up once the search has gone as
+    /// long without an improvement as it took to find the one it has. A dive that keeps creeping
+    /// downward — which is what a pool too large to exhaust does — keeps its budget; a dive that is
+    /// stuck, which is the failure this is here to fix, hands over quickly.
+    fn dive_is_stalled(&self) -> bool {
+        self.nodes.saturating_sub(self.last_improvement)
+            > self.last_improvement.max(self.dive_floor)
+    }
+
+    /// Leave the opening dive and begin deepening, keeping the incumbent the dive found.
+    fn stop_diving(&mut self) {
+        self.diving = false;
+        self.reset_to_root();
+        self.threshold = self.bound_of_current();
+    }
+
+    /// Raise the threshold and restart from the root. `false` means the search is over.
+    fn start_next_pass(&mut self) -> bool {
+        // A dive that runs out of tree has explored everything; there is nothing to deepen into.
+        if self.diving {
+            return false;
+        }
+        let eps = match self.deepening {
+            Some(eps) => eps,
+            None => return false,
+        };
+        // The incumbent is proven optimal: every node that could beat it had a bound at or below
+        // the threshold, so it was visited this pass or an earlier one.
+        if let (Some(best), Some(threshold)) = (self.best, self.threshold) {
+            if best <= threshold {
+                return false;
+            }
+        }
+        // Nothing was rejected by the threshold, so the whole tree is explored.
+        let next = match self.next_threshold.take() {
+            Some(next) => next,
+            None => return false,
+        };
+        let grown = match self.threshold {
+            Some(threshold) => {
+                let stepped = threshold.0 * (1.0 + eps);
+                Ordf32(if stepped > next.0 { stepped } else { next.0 })
+            }
+            None => next,
+        };
+        self.threshold = Some(grown);
+        // No `reset_to_root` here: this runs only once `backtrack_to_next_branch` has popped every
+        // frame, so the selector is already back at the root. `stop_diving` is the caller that
+        // needs it, because it interrupts a dive mid-descent.
+        debug_assert!(self.stack.is_empty(), "a pass ended without unwinding its stack");
+        true
     }
 
     fn cursor(&self) -> usize {
@@ -324,13 +476,13 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
 
         self.apply_include(index);
         let inc_bound = self.bound_of_current();
-        let inc_ok = self.is_promising(inc_bound);
+        let inc_ok = self.admit(inc_bound);
         self.undo_include(index);
 
         let (banned, exc_next_cursor) = self.exclusion_plan(index, cursor);
         self.apply_exclude(&banned);
         let exc_bound = self.bound_of_current();
-        let exc_ok = self.is_promising(exc_bound);
+        let exc_ok = self.admit(exc_bound);
         self.undo_exclude(&banned);
 
         // println!(
