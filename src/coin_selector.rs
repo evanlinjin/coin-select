@@ -4,6 +4,14 @@ use crate::float::FloatExt;
 use crate::{bitset::Bitset, bnb::BnbMetric, float::Ordf32, FeeRate, SelectionProblem, Target};
 use alloc::{sync::Arc, vec::Vec};
 
+/// Replacements [`CoinSelector::repair`] considers per pass.
+///
+/// The free set runs to thousands of coins on a large pool and is read best-value first, so the tail
+/// is coins that cannot cover what the swap gives up anyway. Widening it costs scores linearly and,
+/// on the benchmark's fixtures, buys nothing. Not public: nothing takes it as an argument, so a
+/// caller could read it and not use it.
+const REPAIR_REPLACEMENTS_PER_PASS: usize = 40;
+
 /// The minimum change amount Bitcoin Core's `SelectCoinsSRD` targets; a sensible default for the
 /// `change_lower` argument of [`CoinSelector::select_srd`].
 pub const CHANGE_LOWER: u64 = 50_000;
@@ -571,34 +579,42 @@ impl<'a> CoinSelector<'a> {
     /// swap when `metric` scores the result better. Repeat until nothing improves or `max_swaps`
     /// trial scores are spent. Returns the new score, or `None` when nothing improved.
     ///
-    /// Only the swaps that improve the score are kept, so the selection this leaves is never worse
-    /// than the one it was given. It is a hill climb and stops at a local optimum, not a proof of
+    /// Only the swaps that improve the score are kept, so the score this leaves is never worse than
+    /// the one it was given. It is a hill climb and stops at a local optimum, not a proof of
     /// anything.
     ///
-    /// Returns `None` immediately when the problem has no *shared* unconfirmed ancestors, which is
-    /// the only case this can help: with each ancestor reachable from one candidate there is
-    /// nothing set-dependent for the order to have got wrong, and the pass would be a pure cost.
-    /// [`run_bnb`](Self::run_bnb) already runs this; call it directly after
+    /// **This is the one thing in the crate that deselects.** Everything else — branch and bound,
+    /// [`select_srd`](Self::select_srd) — only ever adds, so callers may reasonably assume an input
+    /// they selected before calling stays selected, which is how a required ("must spend") UTXO is
+    /// expressed. `protected` is how that is preserved: no candidate in it is ever swapped out.
+    /// [`run_bnb`](Self::run_bnb) passes the selection it was handed. A caller with nothing to
+    /// protect passes an empty [`Bitset`].
+    ///
+    /// Bans are the caller's, as everywhere else: a banned candidate is never swapped in.
+    ///
+    /// Returns `None` immediately when there is nothing here to repair — when the problem has no
+    /// *shared* unconfirmed ancestors, so nothing set-dependent exists for the order to have got
+    /// wrong, or when no selected candidate is the sole payer for any ancestor, so no swap could
+    /// refund a bump. [`run_bnb`](Self::run_bnb) already runs this; call it directly after
     /// [`bnb_solutions`](Self::bnb_solutions), which cannot, being an iterator over improvements
     /// rather than a finished answer.
     ///
     /// # Cost
     ///
-    /// One pass over the pool to find the replacements, then `max_swaps` metric scores over
+    /// One pass over the pool to find the replacements, then at most `max_swaps` metric scores over
     /// incrementally updated aggregates. Measured on a 200,000-candidate pool that is 12 ms against
-    /// a 113 ms search; on 20,000 candidates, 1.1 ms against 100 ms.
+    /// a 113 ms search; on 20,000 candidates, 1.1 ms against 100 ms. `metric` is scored up to
+    /// `max_swaps` times on selections that are not adopted, which a stateful metric would see.
     pub fn repair<M: BnbMetric + ?Sized>(
         &mut self,
         metric: &mut M,
         max_swaps: usize,
+        protected: &Bitset,
     ) -> Option<Ordf32> {
         let problem = self.problem();
         if max_swaps == 0 || !problem.has_shared_ancestors() {
             return None;
         }
-        let started = metric.score(&self.compute_view())?;
-        let mut best = started;
-        let mut tried = 0_usize;
 
         // How many selected coins pay for each ancestor. A coin holding one alone is the only one
         // whose removal actually refunds a bump, so this is what says which swaps can pay.
@@ -608,6 +624,24 @@ impl<'a> CoinSelector<'a> {
                 refs[ancestor as usize] += 1;
             }
         }
+        // `has_shared_ancestors` is a property of the *problem*, and it is true as soon as one
+        // unconfirmed parent has two spendable outputs — the everyday shape of a wallet that made a
+        // payment with change. That says nothing about *this* selection, which may hold no
+        // sole-payer at all, so check before paying for anything pool-sized below.
+        let repairable = self.selected_indices().iter().any(|index| {
+            !protected.contains(index)
+                && problem
+                    .drags_in(index)
+                    .iter()
+                    .any(|&ancestor| refs[ancestor as usize] == 1)
+        });
+        if !repairable {
+            return None;
+        }
+
+        let started = metric.score(&self.compute_view())?;
+        let mut best = started;
+        let mut tried = 0_usize;
 
         // Replacements that add no ancestor the selection is not already paying for, best value
         // first: a swap has to cover what dropping the outgoing coin gives up. The only way a
@@ -623,11 +657,13 @@ impl<'a> CoinSelector<'a> {
             })
             .collect::<Vec<_>>();
         // Only the head of this is ever read: a pass looks at `REPAIR_REPLACEMENTS_PER_PASS` of it
-        // and the front advances only as swaps consume entries, of which there is at most one per
-        // selected coin. Sorting 200,000 entries to read a few hundred cost more than the rest of
-        // the pass put together, so partition and sort only the head. The tail keeps every
-        // candidate, merely unordered, so a run that somehow reached it still sees the same set.
-        let head = (Self::REPAIR_REPLACEMENTS_PER_PASS + self.selected_indices().len())
+        // and the front advances only as swaps consume entries, of which there are at most
+        // `max_swaps`. Sorting 200,000 entries to read a few hundred cost more than the rest of the
+        // pass put together, so partition and sort only that much. The tail keeps every candidate,
+        // merely unordered, so a run that exhausts the head still sees the same set on best-effort
+        // ordering rather than missing anything.
+        let head = REPAIR_REPLACEMENTS_PER_PASS
+            .saturating_add(max_swaps)
             .min(free.len());
         if head < free.len() {
             free.select_nth_unstable_by_key(head, |&index| {
@@ -642,16 +678,21 @@ impl<'a> CoinSelector<'a> {
         let mut view = self.compute_view();
         let mut selected = self.selected_indices().iter().collect::<Vec<_>>();
         let mut swaps = Vec::<(usize, usize)>::new();
+        // Swapped-in candidates, skipped when `free` is read. Compacting `free` instead costs a
+        // pass over it per accepted swap, which is pool-sized work back inside the loop: on a
+        // 200,000-candidate pool taking 1,000 swaps that was 49.6 ms against this one's 8.7 ms.
+        let mut taken = Bitset::with_capacity(problem.len());
 
         while tried < max_swaps {
             let mut outgoing = selected
                 .iter()
                 .copied()
                 .filter(|&index| {
-                    problem
-                        .drags_in(index)
-                        .iter()
-                        .any(|&ancestor| refs[ancestor as usize] == 1)
+                    !protected.contains(index)
+                        && problem
+                            .drags_in(index)
+                            .iter()
+                            .any(|&ancestor| refs[ancestor as usize] == 1)
                 })
                 .collect::<Vec<_>>();
             if outgoing.is_empty() {
@@ -665,12 +706,13 @@ impl<'a> CoinSelector<'a> {
                 .iter()
                 .copied()
                 .filter(|&index| {
-                    problem
-                        .drags_in(index)
-                        .iter()
-                        .all(|&ancestor| refs[ancestor as usize] > 0)
+                    !taken.contains(index)
+                        && problem
+                            .drags_in(index)
+                            .iter()
+                            .all(|&ancestor| refs[ancestor as usize] > 0)
                 })
-                .take(Self::REPAIR_REPLACEMENTS_PER_PASS)
+                .take(REPAIR_REPLACEMENTS_PER_PASS)
                 .collect::<Vec<_>>();
             if window.is_empty() {
                 break;
@@ -710,7 +752,7 @@ impl<'a> CoinSelector<'a> {
                     }
                     selected.retain(|&index| index != out);
                     selected.push(into);
-                    free.retain(|&index| index != into);
+                    taken.insert(into);
                     swaps.push((out, into));
                     best = score;
                 }
@@ -729,14 +771,10 @@ impl<'a> CoinSelector<'a> {
         Some(best)
     }
 
-    /// Replacements [`repair`](Self::repair) considers per pass.
-    ///
-    /// The free set runs to thousands of coins on a large pool and is read best-value first, so the
-    /// tail is coins that cannot cover what the swap gives up anyway. Widening it costs scores
-    /// linearly and, on the benchmark's fixtures, buys nothing.
-    pub const REPAIR_REPLACEMENTS_PER_PASS: usize = 40;
-
     /// Trial scores [`run_bnb`](Self::run_bnb) lets [`repair`](Self::repair) spend.
+    ///
+    /// Public so a caller driving [`bnb_solutions`](Self::bnb_solutions) and calling
+    /// [`repair`](Self::repair) itself can match what `run_bnb` does.
     ///
     /// The pass converges well inside this: on the benchmark's scale fixtures, 1,000, 20,000 and
     /// 100,000 return byte-identical selections, and the largest number of swaps any of them
@@ -755,6 +793,12 @@ impl<'a> CoinSelector<'a> {
         metric: M,
         max_rounds: usize,
     ) -> Result<(Ordf32, Drain), NoBnbSolution> {
+        // What the caller had selected and banned on entry. Branch and bound only ever selects and
+        // bans, so these used to be preserved for free; `repair` deselects, and it reads the ban
+        // set to decide what it may swap in, so both have to be restored explicitly.
+        let pinned = self.selected_indices().clone();
+        let banned_on_entry = self.banned().clone();
+
         let mut iter = self.default_bnb_iter(metric);
         let mut rounds = 0_usize;
         let best = iter
@@ -764,11 +808,23 @@ impl<'a> CoinSelector<'a> {
             .flatten()
             .last();
         if let Some((mut selector, score)) = best {
+            // The selector comes back mid-traversal, carrying every ban the exclusion frames on the
+            // path to that node applied. Those are search state, not the caller's: leaving them on
+            // would hide part of the pool from `repair` by an accident of where the last
+            // improvement happened to be found.
+            let search_bans = selector.banned().iter().collect::<Vec<_>>();
+            for index in search_bans {
+                if !banned_on_entry.contains(index) {
+                    selector.unban(index);
+                }
+            }
+
             // The search cannot price a coin by what the rest of the selection already pays for,
             // so where ancestors are shared its answer can be one swap short of a better one.
-            // `repair` only keeps swaps that improve the score, so this can only help.
+            // `repair` only keeps swaps that improve the score, and never swaps out an input the
+            // caller had already selected, so this can only help.
             let score = selector
-                .repair(&mut iter.metric, Self::DEFAULT_REPAIR_SWAPS)
+                .repair(&mut iter.metric, Self::DEFAULT_REPAIR_SWAPS, &pinned)
                 .unwrap_or(score);
             let drain = iter.metric.drain(&selector.compute_view());
             *self = selector;

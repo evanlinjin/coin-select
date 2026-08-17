@@ -9,7 +9,8 @@
 mod common;
 
 use bdk_coin_select::{
-    float::Ordf32, metrics::LowestFee, AncestorToBump, BnbMetric, Candidate, CoinSelector, Drain,
+    float::Ordf32, metrics::LowestFee, AncestorToBump, Bitset, BnbMetric, Candidate, CoinSelector,
+    Drain,
     DrainWeights, FeeRate, Input, Replace, SelectionProblem, Target, TargetFee, TargetOutputs,
     TX_FIXED_FIELD_WEIGHT,
 };
@@ -1125,7 +1126,7 @@ fn repair_drops_a_coin_that_pays_for_an_ancestor_alone() {
     let before = metric().score(&cs.compute_view()).expect("{A, C} is funded");
     assert_eq!(cs.compute_view().ancestor_bump(), 20_000, "P and Q both charged");
 
-    let after = cs.repair(&mut metric(), 100).expect("C can be swapped for B");
+    let after = cs.repair(&mut metric(), 100, &Bitset::default()).expect("C can be swapped for B");
 
     assert!(after < before, "{} is not an improvement on {}", after, before);
     assert!(!cs.is_selected(2), "C still holds Q alone");
@@ -1160,13 +1161,19 @@ fn repair_declines_when_no_ancestor_is_shared() {
     let mut cs = problem.selector();
     cs.select(0);
     cs.select(1);
-    assert!(cs.repair(&mut metric(), 100).is_none());
+    assert!(cs.repair(&mut metric(), 100, &Bitset::default()).is_none());
     assert!(cs.is_selected(0) && cs.is_selected(1), "the selection is untouched");
 }
 
 /// `repair` trials a swap by mutating one cached view and undoing it, thousands of times over. The
 /// cache carries floating-point accumulators, so if `add` and `sub` are not exact inverses the score
 /// drifts as the pass runs and every comparison after that is against a corrupted incumbent.
+///
+/// Note what this does and does not establish. `add` and `sub` touch the reachable-surplus
+/// accumulators in different orders on the do and undo legs, so exactness here is a property of
+/// these magnitudes, not a guarantee of the arithmetic. What makes it safe is who reads them: the
+/// only reader is `ancestor_bump_lower_bound`, which `LowestFee::score` never calls — it is the
+/// bound's, and `repair` never bounds.
 #[test]
 fn view_add_and_sub_round_trip_exactly() {
     let t = target(10.0, 100_000);
@@ -1204,5 +1211,36 @@ fn view_add_and_sub_round_trip_exactly() {
         metric().score(&view),
         Some(before),
         "6,000 undone swaps moved the view's own score",
+    );
+}
+
+/// Branch and bound only ever selects and bans, so `run_bnb` has always returned a superset of what
+/// the caller had already selected — which is how a wallet pins a required input. `repair`
+/// deselects, so it is the one thing in the search path that can break that, and it must not.
+#[test]
+fn run_bnb_keeps_an_input_the_caller_required() {
+    let t = target(10.0, 100_000);
+    let problem = SelectionProblem::new(
+        t,
+        [
+            input(80_000, "P"),
+            input(80_000, "P"),
+            input(80_000, "Q"), // 2: required, and the sole reason Q is paid for
+            input(20_000, CONFIRMED),
+        ],
+        [
+            ancestor("P", 4_000, 0, vec![]),
+            ancestor("Q", 4_000, 0, vec![]),
+        ],
+    );
+
+    let mut cs = problem.selector();
+    cs.select(2);
+    cs.run_bnb(metric(), 100_000).expect("fundable");
+
+    assert!(
+        cs.is_selected(2),
+        "the caller's required input was dropped: got {:?}",
+        cs.selected_indices().iter().collect::<Vec<_>>(),
     );
 }
