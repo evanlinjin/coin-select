@@ -1163,3 +1163,46 @@ fn repair_declines_when_no_ancestor_is_shared() {
     assert!(cs.repair(&mut metric(), 100).is_none());
     assert!(cs.is_selected(0) && cs.is_selected(1), "the selection is untouched");
 }
+
+/// `repair` trials a swap by mutating one cached view and undoing it, thousands of times over. The
+/// cache carries floating-point accumulators, so if `add` and `sub` are not exact inverses the score
+/// drifts as the pass runs and every comparison after that is against a corrupted incumbent.
+#[test]
+fn view_add_and_sub_round_trip_exactly() {
+    let t = target(10.0, 100_000);
+    let problem = SelectionProblem::new(
+        t,
+        [
+            input(80_000, "P"),
+            input(80_000, "P"),
+            input(80_000, "Q"),
+            input(70_000, "Q"),
+            input(60_000, CONFIRMED),
+        ],
+        [
+            ancestor("P", 4_000, 1_500, vec![]),
+            ancestor("Q", 3_000, 100, vec!["P"]),
+        ],
+    );
+    let mut cs = problem.selector();
+    cs.select(0);
+    cs.select(2);
+
+    let view = cs.compute_view();
+    let before = metric().score(&view).expect("funded");
+    let mut view = view;
+    for _ in 0..2_000 {
+        for (out, into) in [(0_usize, 1_usize), (2, 3), (0, 4)] {
+            view.sub(out);
+            view.add(into);
+            let _ = metric().score(&view);
+            view.sub(into);
+            view.add(out);
+        }
+    }
+    assert_eq!(
+        metric().score(&view),
+        Some(before),
+        "6,000 undone swaps moved the view's own score",
+    );
+}
