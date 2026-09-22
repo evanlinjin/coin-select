@@ -4,6 +4,7 @@ use bdk_coin_select::{
     Candidate, CoinSelector, Drain, DrainWeights, Target, TargetFee, TargetOutputs,
 };
 use bitcoin::{consensus::Decodable, ScriptBuf, Transaction};
+use proptest::prelude::*;
 
 fn hex_val(c: u8) -> u8 {
     match c {
@@ -376,4 +377,59 @@ fn new_tr_keyspend_correct_weight() {
         tx.input[0].segwit_weight().to_wu(),
         Candidate::new_tr_keyspend(420).weight
     );
+}
+
+proptest! {
+    /// `CoinSelector` keeps running sums of the selected candidates. After any sequence of
+    /// selects and deselects they must match a recompute from the selected set.
+    #[test]
+    fn running_sums_match_recompute(
+        candidates in proptest::collection::vec(
+            (0u64..1_000_000, 0u64..2_000, 0usize..4, 0usize..4).prop_map(
+                |(value, weight, segwit_count, legacy_count)| Candidate {
+                    value,
+                    weight,
+                    segwit_count,
+                    legacy_count,
+                },
+            ),
+            1..300,
+        ),
+        ops in proptest::collection::vec((any::<proptest::sample::Index>(), any::<bool>()), 0..600),
+    ) {
+        let mut cs = CoinSelector::new(
+            &candidates,
+            Target {
+                fee: TargetFee::ZERO,
+                outputs: TargetOutputs::fund_outputs([]),
+                max_weight: None,
+            },
+        );
+        for (index, select) in ops {
+            let index = index.index(candidates.len());
+            if select {
+                cs.select(index);
+            } else {
+                cs.deselect(index);
+            }
+
+            let selected = cs.selected().map(|(_, c)| c).collect::<Vec<_>>();
+            let is_segwit_tx = selected.iter().any(|c| c.segwit_count > 0);
+            let input_count = selected.iter().map(|c| c.segwit_count + c.legacy_count).sum::<usize>();
+            let varint_size = match input_count {
+                0..=0xfc => 1,
+                0xfd..=0xffff => 3,
+                _ => 5,
+            };
+            let expected_weight = varint_size * 4
+                + selected
+                    .iter()
+                    .map(|c| c.weight + if is_segwit_tx { c.legacy_count as u64 } else { 0 })
+                    .sum::<u64>()
+                + if is_segwit_tx { 2 } else { 0 };
+
+            prop_assert_eq!(cs.input_weight(), expected_weight);
+            prop_assert_eq!(cs.selected_value(), selected.iter().map(|c| c.value).sum::<u64>());
+        }
+    }
 }
