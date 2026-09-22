@@ -28,6 +28,8 @@ mod target;
 pub use target::*;
 mod drain;
 pub use drain::*;
+mod selection_problem;
+pub use selection_problem::*;
 
 /// Txin "base" fields include `outpoint` (32+4) and `nSequence` (4) and 1 byte for the scriptSig
 /// length.
