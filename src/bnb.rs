@@ -173,9 +173,11 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
 
     /// The candidates to ban when excluding `index`, and the cursor to resume from.
     ///
-    /// For the exclusion branch, we keep banning candidates that have the same value, weight and
-    /// input counts as the one we exclude. The counts matter because a segwit and a legacy input of
-    /// equal weight change the tx weight differently. Candidates are only compared until the first
+    /// For the exclusion branch, we keep banning candidates that are interchangeable with the one
+    /// we exclude: same value, weight and input counts, and dragging in exactly the same unconfirmed
+    /// ancestors. The counts matter because a segwit and a legacy input of equal weight change the
+    /// tx weight differently, and two coins of equal value and weight are not interchangeable if one
+    /// of them drags in an ancestor that needs bumping. Candidates are only compared until the first
     /// mismatch, since this exploits them being adjacent in the sorted order.
     fn exclusion_plan(&self, index: usize, cursor: usize) -> (Vec<usize>, usize) {
         let next = self.selector.candidate(index);
@@ -185,6 +187,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
             next.segwit_count,
             next.legacy_count,
         );
+        let to_ban_drags_in = self.selector.problem().drags_in(index);
         let mut banned = alloc::vec![index];
         let mut next_cursor = cursor + 1;
         for (next_index, next) in self.selector.candidates().skip(cursor + 1) {
@@ -199,6 +202,7 @@ impl<'a, M: BnbMetric> BnbIter<'a, M> {
                 next.segwit_count,
                 next.legacy_count,
             ) != to_ban
+                || self.selector.problem().drags_in(next_index) != to_ban_drags_in
             {
                 break;
             }
