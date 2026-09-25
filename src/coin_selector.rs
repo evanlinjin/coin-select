@@ -18,6 +18,7 @@ pub const CHANGE_LOWER: u64 = 50_000;
 #[derive(Debug, Clone)]
 pub struct CoinSelector<'a> {
     candidates: &'a [Candidate],
+    target: Target,
     selected: Bitset,
     banned: Bitset,
     candidate_order: Arc<Vec<usize>>,
@@ -35,12 +36,54 @@ impl<'a> CoinSelector<'a> {
     ///
     /// Note that methods in `CoinSelector` will refer to inputs by the index in the `candidates`
     /// slice you pass in.
-    pub fn new(candidates: &'a [Candidate]) -> Self {
+    ///
+    /// `target` is fixed for the life of the selector. Everything it reports is measured against
+    /// that one target.
+    pub fn new(candidates: &'a [Candidate], target: Target) -> Self {
         Self {
             candidates,
+            target,
             selected: Bitset::with_capacity(candidates.len()),
             banned: Bitset::with_capacity(candidates.len()),
             candidate_order: Arc::new((0..candidates.len()).collect::<Vec<_>>()),
+        }
+    }
+
+    /// What this selector is funding.
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
+    /// A copy of this selector — same selection, bans and candidate order — that funds `target`
+    /// instead.
+    ///
+    /// Use this to measure a selection against a second target, for example to check whether a fee
+    /// bump needs more inputs.
+    ///
+    /// ```
+    /// # use bdk_coin_select::{Candidate, CoinSelector, FeeRate, Target, TargetFee, TargetOutputs};
+    /// # let candidates = [Candidate::new_tr_keyspend(100_000), Candidate::new_tr_keyspend(100_000)];
+    /// let target = Target {
+    ///     outputs: TargetOutputs::fund_outputs([(46 * 4, 90_000)]),
+    ///     fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(1.0)),
+    ///     max_weight: None,
+    /// };
+    /// let mut selector = CoinSelector::new(&candidates, target);
+    /// selector.select(0);
+    /// assert!(selector.is_funded());
+    ///
+    /// // Would that same selection still fund the transaction at a much higher feerate?
+    /// let bumped = selector.with_target(Target {
+    ///     fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(500.0)),
+    ///     ..target
+    /// });
+    /// assert_eq!(bumped.selected_indices(), selector.selected_indices());
+    /// assert!(!bumped.is_funded(), "the bump needs another input");
+    /// ```
+    pub fn with_target(&self, target: Target) -> Self {
+        Self {
+            target,
+            ..self.clone()
         }
     }
 
@@ -115,8 +158,9 @@ impl<'a> CoinSelector<'a> {
         self.selected.contains(index)
     }
 
-    /// Whether the candidates can cover this `target`'s **value** (net of input fees) — i.e. whether
-    /// enough value is reachable for [`is_funded`] to hold. Respects [`ban`]ned candidates.
+    /// Whether the candidates can cover the [`target`](Self::target)'s **value** (net of input
+    /// fees) — i.e. whether enough value is reachable for [`is_funded`] to hold. Respects
+    /// [`ban`]ned candidates.
     ///
     /// Selecting *all* effective inputs maximizes the value available, so if that can't meet the
     /// target value, nothing can. Monotone, hence exact.
@@ -128,10 +172,10 @@ impl<'a> CoinSelector<'a> {
     /// [`ban`]: Self::ban
     /// [`is_funded`]: Self::is_funded
     /// [`select_until_target_met`]: Self::select_until_target_met
-    pub fn is_fundable(&self, target: Target) -> bool {
+    pub fn is_fundable(&self) -> bool {
         let mut test = self.clone();
-        test.select_all_effective(target.fee.rate);
-        test.is_funded(target)
+        test.select_all_effective();
+        test.is_funded()
     }
 
     /// Returns true if no candidates have been selected.
@@ -176,25 +220,26 @@ impl<'a> CoinSelector<'a> {
     ///
     /// If you don't have any drain outputs (only target outputs) just set drain_weights to
     /// [`DrainWeights::NONE`].
-    pub fn weight(&self, target_ouputs: TargetOutputs, drain_weight: DrainWeights) -> u64 {
+    pub fn weight(&self, drain_weight: DrainWeights) -> u64 {
         TX_FIXED_FIELD_WEIGHT
             + self.input_weight()
-            + target_ouputs.output_weight_with_drain(drain_weight)
+            + self.target.outputs.output_weight_with_drain(drain_weight)
     }
 
-    /// How much the current selection overshoots the value needed to achieve `target`.
+    /// How much the current selection overshoots the value needed to achieve the
+    /// [`target`](Self::target).
     ///
     /// In order for the resulting transaction to be valid this must be 0 or above. If it's above 0
-    /// this means the transaction will overpay for what it needs to reach `target`.
-    pub fn excess(&self, target: Target, drain: Drain) -> i64 {
-        self.rate_excess(target, drain)
-            .min(self.absolute_excess(target, drain))
-            .min(self.replacement_excess(target, drain))
+    /// this means the transaction will overpay for what it needs to reach the target.
+    pub fn excess(&self, drain: Drain) -> i64 {
+        self.rate_excess(drain)
+            .min(self.absolute_excess(drain))
+            .min(self.replacement_excess(drain))
     }
 
     /// How much extra value needs to be selected to reach the target.
-    pub fn missing(&self, target: Target) -> u64 {
-        let excess = self.excess(target, Drain::NONE);
+    pub fn missing(&self) -> u64 {
+        let excess = self.excess(Drain::NONE);
         if excess < 0 {
             excess.unsigned_abs()
         } else {
@@ -202,56 +247,56 @@ impl<'a> CoinSelector<'a> {
         }
     }
 
-    /// How much the current selection overshoots the value need to satisfy `target.fee.rate` and
-    /// `target.value` (while ignoring `target.fee.absolute`).
-    pub fn rate_excess(&self, target: Target, drain: Drain) -> i64 {
+    /// How much the current selection overshoots the value need to satisfy `self.target.fee.rate` and
+    /// `self.target.value` (while ignoring `self.target.fee.absolute`).
+    pub fn rate_excess(&self, drain: Drain) -> i64 {
         self.selected_value() as i64
-            - target.value() as i64
+            - self.target.value() as i64
             - drain.value as i64
-            - self.implied_fee_from_feerate(target, drain.weights) as i64
+            - self.implied_fee_from_feerate(drain.weights) as i64
     }
 
-    /// Same as [rate_excess](Self::rate_excess) except `target.fee.rate` is applied to the
+    /// Same as [rate_excess](Self::rate_excess) except `self.target.fee.rate` is applied to the
     /// implied transaction's weight units directly without any conversion to vbytes.
-    pub fn rate_excess_wu(&self, target: Target, drain: Drain) -> i64 {
+    pub fn rate_excess_wu(&self, drain: Drain) -> i64 {
         self.selected_value() as i64
-            - target.value() as i64
+            - self.target.value() as i64
             - drain.value as i64
-            - self.implied_fee_from_feerate_wu(target, drain.weights) as i64
+            - self.implied_fee_from_feerate_wu(drain.weights) as i64
     }
 
-    /// How much the current selection overshoots the value needed to satisfy `target.fee.absolute`
-    /// and `target.value` (while ignoring `target.fee.rate`).
-    pub fn absolute_excess(&self, target: Target, drain: Drain) -> i64 {
+    /// How much the current selection overshoots the value needed to satisfy `self.target.fee.absolute`
+    /// and `self.target.value` (while ignoring `self.target.fee.rate`).
+    pub fn absolute_excess(&self, drain: Drain) -> i64 {
         self.selected_value() as i64
-            - target.value() as i64
+            - self.target.value() as i64
             - drain.value as i64
-            - target.fee.absolute as i64
+            - self.target.fee.absolute as i64
     }
 
     /// How much the current selection overshoots the value needed to satisfy RBF's rule 4.
-    pub fn replacement_excess(&self, target: Target, drain: Drain) -> i64 {
+    pub fn replacement_excess(&self, drain: Drain) -> i64 {
         let mut replacement_excess_needed = 0;
-        if let Some(replace) = target.fee.replace {
+        if let Some(replace) = self.target.fee.replace {
             replacement_excess_needed =
-                replace.min_fee_to_do_replacement(self.weight(target.outputs, drain.weights))
+                replace.min_fee_to_do_replacement(self.weight(drain.weights))
         }
         self.selected_value() as i64
-            - target.value() as i64
+            - self.target.value() as i64
             - drain.value as i64
             - replacement_excess_needed as i64
     }
 
     /// Same as [replacement_excess](Self::replacement_excess) except the replacement fee
     /// is calculated using weight units directly without any conversion to vbytes.
-    pub fn replacement_excess_wu(&self, target: Target, drain: Drain) -> i64 {
+    pub fn replacement_excess_wu(&self, drain: Drain) -> i64 {
         let mut replacement_excess_needed = 0;
-        if let Some(replace) = target.fee.replace {
+        if let Some(replace) = self.target.fee.replace {
             replacement_excess_needed =
-                replace.min_fee_to_do_replacement_wu(self.weight(target.outputs, drain.weights))
+                replace.min_fee_to_do_replacement_wu(self.weight(drain.weights))
         }
         self.selected_value() as i64
-            - target.value() as i64
+            - self.target.value() as i64
             - drain.value as i64
             - replacement_excess_needed as i64
     }
@@ -260,67 +305,67 @@ impl<'a> CoinSelector<'a> {
     /// the `target`'s value and weight. It is essentially telling you what target feerate you currently have.
     ///
     /// Returns `None` if the feerate would be negative or infinity.
-    pub fn implied_feerate(&self, target_outputs: TargetOutputs, drain: Drain) -> Option<FeeRate> {
-        let numerator =
-            self.selected_value() as i64 - target_outputs.value_sum as i64 - drain.value as i64;
-        let denom = self.weight(target_outputs, drain.weights);
+    pub fn implied_feerate(&self, drain: Drain) -> Option<FeeRate> {
+        let numerator = self.selected_value() as i64
+            - self.target.outputs.value_sum as i64
+            - drain.value as i64;
+        let denom = self.weight(drain.weights);
         if numerator < 0 || denom == 0 {
             return None;
         }
         Some(FeeRate::from_sat_per_wu(numerator as f32 / denom as f32))
     }
 
-    /// The fee the current selection and `drain_weight` should pay to satisfy `target_fee`.
+    /// The fee the current selection and `drain_weight` should pay to satisfy the
+    /// [`target`](Self::target)'s [`TargetFee`].
     ///
     /// This compares the fee calculated from the target feerate with the fee calculated from the
     /// [`Replace`] constraints and returns the larger of the two.
     ///
     /// `drain_weight` can be 0 to indicate no draining output.
-    pub fn implied_fee(&self, target: Target, drain_weights: DrainWeights) -> u64 {
+    pub fn implied_fee(&self, drain_weights: DrainWeights) -> u64 {
         let mut implied_fee = self
-            .implied_fee_from_feerate(target, drain_weights)
-            .max(target.fee.absolute);
+            .implied_fee_from_feerate(drain_weights)
+            .max(self.target.fee.absolute);
 
-        if let Some(replace) = target.fee.replace {
+        if let Some(replace) = self.target.fee.replace {
             implied_fee = Ord::max(
                 implied_fee,
-                replace.min_fee_to_do_replacement(self.weight(target.outputs, drain_weights)),
+                replace.min_fee_to_do_replacement(self.weight(drain_weights)),
             );
         }
 
         implied_fee
     }
 
-    fn implied_fee_from_feerate(&self, target: Target, drain_weights: DrainWeights) -> u64 {
-        target
-            .fee
-            .rate
-            .implied_fee(self.weight(target.outputs, drain_weights))
+    fn implied_fee_from_feerate(&self, drain_weights: DrainWeights) -> u64 {
+        self.target.fee.rate.implied_fee(self.weight(drain_weights))
     }
 
-    fn implied_fee_from_feerate_wu(&self, target: Target, drain_weights: DrainWeights) -> u64 {
-        target
+    fn implied_fee_from_feerate_wu(&self, drain_weights: DrainWeights) -> u64 {
+        self.target
             .fee
             .rate
-            .implied_fee_wu(self.weight(target.outputs, drain_weights))
+            .implied_fee_wu(self.weight(drain_weights))
     }
 
     /// The actual fee the selection would pay if it was used in a transaction that had
     /// `target_value` value for outputs and change output of `drain_value`.
     ///
     /// This can be negative when the selection is invalid (outputs are greater than inputs).
-    pub fn fee(&self, target_value: u64, drain_value: u64) -> i64 {
-        self.selected_value() as i64 - target_value as i64 - drain_value as i64
+    pub fn fee(&self, drain_value: u64) -> i64 {
+        self.selected_value() as i64 - self.target.value() as i64 - drain_value as i64
     }
 
     /// The value of the current selected inputs minus the fee needed to pay for the selected inputs
-    pub fn effective_value(&self, feerate: FeeRate) -> i64 {
-        self.selected_value() as i64 - (self.input_weight() as f32 * feerate.spwu()).ceil() as i64
+    pub fn effective_value(&self) -> i64 {
+        self.selected_value() as i64
+            - (self.input_weight() as f32 * self.target.fee.rate.spwu()).ceil() as i64
     }
 
     // /// Waste sum of all selected inputs.
-    fn input_waste(&self, feerate: FeeRate, long_term_feerate: FeeRate) -> f32 {
-        self.input_weight() as f32 * (feerate.spwu() - long_term_feerate.spwu())
+    fn input_waste(&self, long_term_feerate: FeeRate) -> f32 {
+        self.input_weight() as f32 * (self.target.fee.rate.spwu() - long_term_feerate.spwu())
     }
 
     /// Sorts the candidates by the comparision function.
@@ -381,29 +426,24 @@ impl<'a> CoinSelector<'a> {
     /// You can pass in an `excess_discount` which must be between `0.0..1.0`. Passing in `1.0` gives you no discount
     ///
     /// [waste metric]: https://bitcoin.stackexchange.com/questions/113622/what-does-waste-metric-mean-in-the-context-of-coin-selection
-    pub fn waste(
-        &self,
-        target: Target,
-        long_term_feerate: FeeRate,
-        drain: Drain,
-        excess_discount: f32,
-    ) -> f32 {
+    pub fn waste(&self, long_term_feerate: FeeRate, drain: Drain, excess_discount: f32) -> f32 {
         debug_assert!((0.0..=1.0).contains(&excess_discount));
-        let mut waste = self.input_waste(target.fee.rate, long_term_feerate);
+        let mut waste = self.input_waste(long_term_feerate);
 
         if drain.is_none() {
             // We don't allow negative excess waste since negative excess just means you haven't
             // satisified target yet in which case you probably shouldn't be calling this function.
-            let mut excess_waste = self.excess(target, drain).max(0) as f32;
+            let mut excess_waste = self.excess(drain).max(0) as f32;
             // we allow caller to discount this waste depending on how wasteful excess actually is
             // to them.
             excess_waste *= excess_discount.clamp(0.0, 1.0);
             waste += excess_waste;
         } else {
-            waste +=
-                drain
-                    .weights
-                    .waste(target.fee.rate, long_term_feerate, target.outputs.n_outputs);
+            waste += drain.weights.waste(
+                self.target.fee.rate,
+                long_term_feerate,
+                self.target.outputs.n_outputs,
+            );
         }
 
         waste
@@ -467,9 +507,9 @@ impl<'a> CoinSelector<'a> {
     /// Always `true` when `max_weight` is `None`. Note this is the *anti-monotone* half of
     /// feasibility (adding inputs adds weight), so it is kept separate from the monotone
     /// value-only [`is_funded`](Self::is_funded).
-    pub fn is_within_max_weight(&self, target: Target, drain_weights: DrainWeights) -> bool {
-        match target.max_weight {
-            Some(max_weight) => self.weight(target.outputs, drain_weights) <= max_weight,
+    pub fn is_within_max_weight(&self, drain_weights: DrainWeights) -> bool {
+        match self.target.max_weight {
+            Some(max_weight) => self.weight(drain_weights) <= max_weight,
             None => true,
         }
     }
@@ -479,8 +519,8 @@ impl<'a> CoinSelector<'a> {
     ///
     /// This is **monotone**: selecting more never un-meets it. It deliberately does *not* include
     /// the weight cap — see [`is_within_max_weight`](Self::is_within_max_weight).
-    pub fn is_funded_with_drain(&self, target: Target, drain: Drain) -> bool {
-        self.excess(target, drain) >= 0
+    pub fn is_funded_with_drain(&self, drain: Drain) -> bool {
+        self.excess(drain) >= 0
     }
 
     /// Whether the selection covers the target **value** (net of input fees), i.e. [`excess`] is
@@ -492,8 +532,8 @@ impl<'a> CoinSelector<'a> {
     /// [`excess`]: Self::excess
     /// [`is_within_max_weight`]: Self::is_within_max_weight
     /// [`is_funded_with_drain`]: Self::is_funded_with_drain
-    pub fn is_funded(&self, target: Target) -> bool {
-        self.is_funded_with_drain(target, Drain::NONE)
+    pub fn is_funded(&self) -> bool {
+        self.is_funded_with_drain(Drain::NONE)
     }
 
     /// Select all unselected candidates
@@ -506,27 +546,21 @@ impl<'a> CoinSelector<'a> {
     }
 
     /// The value of the change output should have to drain the excess value while maintaining the
-    /// constraints of `target` and respecting `change_policy`.
+    /// constraints of the [`target`](Self::target) and respecting `change_policy`.
     ///
     /// If not change output should be added according to policy then it will return `None`.
-    pub fn drain_value(&self, target: Target, change_policy: ChangePolicy) -> Option<u64> {
-        let excess = self.excess(
-            target,
-            Drain {
-                weights: change_policy.drain_weights,
-                value: 0,
-            },
-        );
+    pub fn drain_value(&self, change_policy: ChangePolicy) -> Option<u64> {
+        let excess = self.excess(Drain {
+            weights: change_policy.drain_weights,
+            value: 0,
+        });
         if excess > change_policy.min_value as i64 {
             debug_assert_eq!(
-                self.is_funded(target),
-                self.is_funded_with_drain(
-                    target,
-                    Drain {
-                        weights: change_policy.drain_weights,
-                        value: excess as u64
-                    }
-                ),
+                self.is_funded(),
+                self.is_funded_with_drain(Drain {
+                    weights: change_policy.drain_weights,
+                    value: excess as u64
+                }),
                 "if the target is met without a drain it must be met after adding the drain"
             );
             Some(excess as u64)
@@ -546,8 +580,8 @@ impl<'a> CoinSelector<'a> {
     /// [`is_funded_with_drain`]: Self::is_funded_with_drain
     /// [`is_funded`]: Self::is_funded
     #[must_use]
-    pub fn drain(&self, target: Target, change_policy: ChangePolicy) -> Drain {
-        match self.drain_value(target, change_policy) {
+    pub fn drain(&self, change_policy: ChangePolicy) -> Drain {
+        match self.drain_value(change_policy) {
             Some(value) => Drain {
                 weights: change_policy.drain_weights,
                 value,
@@ -556,15 +590,15 @@ impl<'a> CoinSelector<'a> {
         }
     }
 
-    /// Select all candidates with an *effective value* greater than 0 at the provided `feerate`.
+    /// Select all candidates with an *effective value* greater than 0 at the target's feerate.
     ///
-    /// A candidate if effective if it provides more value than it takes to pay for at `feerate`.
-    pub fn select_all_effective(&mut self, feerate: FeeRate) {
+    /// A candidate is effective if it provides more value than it takes to pay for at that feerate.
+    pub fn select_all_effective(&mut self) {
         for i in 0..self.candidate_order.len() {
             let cand_index = self.candidate_order[i];
             if self.selected.contains(cand_index)
                 || self.banned.contains(cand_index)
-                || self.candidates[cand_index].effective_value(feerate) <= 0.0
+                || self.candidates[cand_index].effective_value(self.target.fee.rate) <= 0.0
             {
                 continue;
             }
@@ -572,7 +606,7 @@ impl<'a> CoinSelector<'a> {
         }
     }
 
-    /// Select candidates until `target` has been met.
+    /// Select candidates until the [`target`](Self::target) has been met.
     ///
     /// # Errors
     ///
@@ -580,14 +614,13 @@ impl<'a> CoinSelector<'a> {
     /// - [`SelectError::MaxWeightExceeded`] if the value is met but the resulting selection exceeds
     ///   [`Target::max_weight`]. Note this only reflects *this* in-order greedy selection; a
     ///   different selection might still fit the cap (use branch and bound to search for one).
-    pub fn select_until_target_met(&mut self, target: Target) -> Result<(), SelectError> {
-        self.select_until(|cs| cs.is_funded(target))
-            .ok_or_else(|| {
-                SelectError::InsufficientFunds(InsufficientFunds {
-                    missing: self.excess(target, Drain::NONE).unsigned_abs(),
-                })
-            })?;
-        if !self.is_within_max_weight(target, DrainWeights::NONE) {
+    pub fn select_until_target_met(&mut self) -> Result<(), SelectError> {
+        self.select_until(|cs| cs.is_funded()).ok_or_else(|| {
+            SelectError::InsufficientFunds(InsufficientFunds {
+                missing: self.excess(Drain::NONE).unsigned_abs(),
+            })
+        })?;
+        if !self.is_within_max_weight(DrainWeights::NONE) {
             return Err(SelectError::MaxWeightExceeded);
         }
         Ok(())
@@ -637,7 +670,6 @@ impl<'a> CoinSelector<'a> {
     // the max-weight PR lands.
     pub fn select_srd(
         &mut self,
-        target: Target,
         drain_weights: DrainWeights,
         change_lower: u64,
         rng: impl FnMut() -> u64,
@@ -648,14 +680,11 @@ impl<'a> CoinSelector<'a> {
         let mut excess = 0_i64;
 
         self.select_until(|cs| {
-            is_within_max_weight = cs.is_within_max_weight(target, drain_weights);
-            excess = cs.excess(
-                target,
-                Drain {
-                    weights: drain_weights,
-                    value: 0,
-                },
-            );
+            is_within_max_weight = cs.is_within_max_weight(drain_weights);
+            excess = cs.excess(Drain {
+                weights: drain_weights,
+                value: 0,
+            });
             excess >= change_lower as i64 || !is_within_max_weight
         })
         .ok_or_else(|| {
@@ -688,10 +717,9 @@ impl<'a> CoinSelector<'a> {
     /// Most of the time, you would want to use [`CoinSelector::run_bnb`] instead.
     pub fn bnb_solutions<M: BnbMetric>(
         &self,
-        target: Target,
         metric: M,
     ) -> impl Iterator<Item = Option<(CoinSelector<'a>, Ordf32)>> {
-        crate::bnb::BnbIter::new(self.clone(), target, metric)
+        crate::bnb::BnbIter::new(self.clone(), metric)
     }
 
     /// Run branch and bound to minimize the score of the provided [`BnbMetric`].
@@ -703,11 +731,10 @@ impl<'a> CoinSelector<'a> {
     /// Use [`CoinSelector::bnb_solutions`] to access the branch and bound iterator directly.
     pub fn run_bnb<M: BnbMetric>(
         &mut self,
-        target: Target,
         metric: M,
         max_rounds: usize,
     ) -> Result<(Ordf32, Drain), NoBnbSolution> {
-        let mut iter = crate::bnb::BnbIter::new(self.clone(), target, metric);
+        let mut iter = crate::bnb::BnbIter::new(self.clone(), metric);
         let mut rounds = 0_usize;
         let best = iter
             .by_ref()
@@ -716,7 +743,7 @@ impl<'a> CoinSelector<'a> {
             .flatten()
             .last();
         if let Some((selector, score)) = best {
-            let drain = iter.metric.drain(&selector, target);
+            let drain = iter.metric.drain(&selector);
             *self = selector;
             return Ok((score, drain));
         }
@@ -729,7 +756,7 @@ impl<'a> CoinSelector<'a> {
             assert_eq!(rounds, max_rounds); // still-yielding ⟹ we truncated at the cap
             return Err(NoBnbSolution::RoundLimit { max_rounds, rounds });
         }
-        if !self.is_fundable(target) {
+        if !self.is_fundable() {
             return Err(NoBnbSolution::InsufficientFunds);
         }
         Err(NoBnbSolution::MaxWeightExceeded)

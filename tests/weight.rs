@@ -1,6 +1,8 @@
 #![allow(clippy::zero_prefixed_literal)]
 
-use bdk_coin_select::{Candidate, CoinSelector, Drain, DrainWeights, TargetOutputs};
+use bdk_coin_select::{
+    Candidate, CoinSelector, Drain, DrainWeights, Target, TargetFee, TargetOutputs,
+};
 use bitcoin::{consensus::Decodable, ScriptBuf, Transaction};
 
 fn hex_val(c: u8) -> u8 {
@@ -46,16 +48,21 @@ fn segwit_one_input_one_output() {
         n_outputs: tx.output.len(),
     };
 
-    let mut coin_selector = CoinSelector::new(&candidates);
+    let target = Target {
+        outputs: target_ouputs,
+        fee: TargetFee::ZERO,
+        max_weight: None,
+    };
+    let mut coin_selector = CoinSelector::new(&candidates, target);
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector.weight(DrainWeights::NONE),
         tx.weight().to_wu()
     );
     assert_eq!(
         (coin_selector
-            .implied_feerate(target_ouputs, Drain::NONE)
+            .implied_feerate(Drain::NONE)
             .unwrap()
             .as_sat_vb()
             * 10.0)
@@ -83,23 +90,27 @@ fn segwit_two_inputs_one_output() {
         })
         .collect::<Vec<_>>();
 
-    let mut coin_selector = CoinSelector::new(&candidates);
-
     let target_ouputs = TargetOutputs {
         value_sum: tx.output.iter().map(|output| output.value.to_sat()).sum(),
         weight_sum: tx.output.iter().map(|output| output.weight().to_wu()).sum(),
         n_outputs: tx.output.len(),
     };
+    let target = Target {
+        outputs: target_ouputs,
+        fee: TargetFee::ZERO,
+        max_weight: None,
+    };
+    let mut coin_selector = CoinSelector::new(&candidates, target);
 
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector.weight(DrainWeights::NONE),
         tx.weight().to_wu()
     );
     assert_eq!(
         (coin_selector
-            .implied_feerate(target_ouputs, Drain::NONE)
+            .implied_feerate(Drain::NONE)
             .unwrap()
             .as_sat_vb()
             * 10.0)
@@ -133,16 +144,21 @@ fn legacy_three_inputs() {
         n_outputs: tx.output.len(),
     };
 
-    let mut coin_selector = CoinSelector::new(&candidates);
+    let target = Target {
+        outputs: target_ouputs,
+        fee: TargetFee::ZERO,
+        max_weight: None,
+    };
+    let mut coin_selector = CoinSelector::new(&candidates, target);
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector.weight(DrainWeights::NONE),
         orig_weight.to_wu()
     );
     assert_eq!(
         (coin_selector
-            .implied_feerate(target_ouputs, Drain::NONE)
+            .implied_feerate(Drain::NONE)
             .unwrap()
             .as_sat_vb()
             * 10.0)
@@ -191,11 +207,16 @@ fn legacy_three_inputs_one_segwit() {
         n_outputs: tx.output.len(),
     };
 
-    let mut coin_selector = CoinSelector::new(&candidates);
+    let target = Target {
+        outputs: target_ouputs,
+        fee: TargetFee::ZERO,
+        max_weight: None,
+    };
+    let mut coin_selector = CoinSelector::new(&candidates, target);
     coin_selector.select_all();
 
     assert_eq!(
-        coin_selector.weight(target_ouputs, DrainWeights::NONE),
+        coin_selector.weight(DrainWeights::NONE),
         tx.weight().to_wu()
     );
 }

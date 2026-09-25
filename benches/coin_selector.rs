@@ -56,7 +56,8 @@ fn bench_coin_selector_clone(c: &mut Criterion) {
     let mut group = c.benchmark_group("clone");
     for &n in &[64usize, 256, 1024, 4096] {
         let candidates = make_candidates(n);
-        let mut selector = CoinSelector::new(&candidates);
+        let (target, _) = make_bnb_inputs(&candidates);
+        let mut selector = CoinSelector::new(&candidates, target);
         // Select ~10% of candidates so `selected` is non-trivial to copy.
         for i in (0..n).step_by(10) {
             selector.select(i);
@@ -74,8 +75,8 @@ fn bench_run_bnb_lowest_fee(c: &mut Criterion) {
     group.sample_size(20);
     for &n in &[20usize, 50, 100, 200] {
         let candidates = make_candidates(n);
-        let selector = CoinSelector::new(&candidates);
         let (target, long_term_feerate) = make_bnb_inputs(&candidates);
+        let selector = CoinSelector::new(&candidates, target);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_batched(
                 || selector.clone(),
@@ -85,7 +86,7 @@ fn bench_run_bnb_lowest_fee(c: &mut Criterion) {
                         dust_relay_feerate: FeeRate::from_sat_per_vb(1.0),
                         drain_weights: DrainWeights::TR_KEYSPEND,
                     };
-                    let _ = sel.run_bnb(target, metric, black_box(100_000));
+                    let _ = sel.run_bnb(metric, black_box(100_000));
                     sel
                 },
                 BatchSize::SmallInput,
