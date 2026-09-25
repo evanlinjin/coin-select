@@ -185,27 +185,14 @@ impl<'a> CoinSelector<'a> {
 
     /// The weight of the inputs including the witness header and the varint for the number of
     /// inputs.
+    ///
+    /// The transaction is always priced as segwit, so a selection of only legacy inputs is
+    /// overestimated by the 2 WU witness header plus 1 WU per input (see [`Candidate::weight`]).
     pub fn input_weight(&self) -> u64 {
-        let is_segwit_tx = self.selected().any(|(_, wv)| wv.is_segwit);
-        let witness_header_extra_weight = is_segwit_tx as u64 * 2;
-
         let input_count = self.selected().map(|(_, wv)| wv.input_count).sum::<usize>();
         let input_varint_weight = varint_size(input_count) * 4;
-
-        let selected_weight: u64 = self
-            .selected()
-            .map(|(_, candidate)| {
-                let mut weight = candidate.weight;
-                if is_segwit_tx && !candidate.is_segwit {
-                    // non-segwit candidates do not have the witness length field included in their
-                    // weight field so we need to add 1 here if it's in a segwit tx.
-                    weight += 1;
-                }
-                weight
-            })
-            .sum();
-
-        input_varint_weight + selected_weight + witness_header_extra_weight
+        let selected_weight: u64 = self.selected().map(|(_, wv)| wv.weight).sum();
+        input_varint_weight + selected_weight + SEGWIT_HEADER_WEIGHT
     }
 
     /// Absolute value sum of all selected inputs.
@@ -921,34 +908,39 @@ impl std::error::Error for NoBnbSolution {}
 pub struct Candidate {
     /// Total value of the UTXO(s) that this [`Candidate`] represents.
     pub value: u64,
-    /// Total weight of including this/these UTXO(s).
-    /// `txin` fields: `prevout`, `nSequence`, `scriptSigLen`, `scriptSig`, `scriptWitnessLen`,
-    /// `scriptWitness` should all be included.
+    /// Total weight of the input(s) as serialized in a segwit transaction, i.e. the sum of
+    /// `TxIn::segwit_weight` from rust-bitcoin. That is `prevout`, `nSequence`, `scriptSigLen`,
+    /// `scriptSig`, `scriptWitnessLen` and `scriptWitness`, including the 1 WU empty witness a legacy
+    /// input serializes in a segwit transaction.
+    ///
+    /// [`CoinSelector`] always prices the transaction as segwit. A transaction that spends only
+    /// legacy inputs has no witness section, so its weight is overestimated by 2 WU plus 1 WU per
+    /// input. This never undershoots the target feerate.
     pub weight: u64,
     /// Total number of inputs; so we can calculate extra `varint` weight due to `vin` len changes.
     pub input_count: usize,
-    /// Whether this [`Candidate`] contains at least one segwit spend.
-    pub is_segwit: bool,
 }
 
 impl Candidate {
     /// Create a [`Candidate`] input that spends a single taproot keyspend output.
     pub fn new_tr_keyspend(value: u64) -> Self {
-        let weight = TR_KEYSPEND_SATISFACTION_WEIGHT;
-        Self::new(value, weight, true)
-    }
-
-    /// Create a new [`Candidate`] that represents a single input.
-    ///
-    /// `satisfaction_weight` is the weight of `scriptSigLen + scriptSig + scriptWitnessLen +
-    /// scriptWitness`.
-    pub fn new(value: u64, satisfaction_weight: u64, is_segwit: bool) -> Candidate {
-        let weight = TXIN_BASE_WEIGHT + satisfaction_weight;
         Candidate {
             value,
-            weight,
+            weight: TR_KEYSPEND_TXIN_WEIGHT,
             input_count: 1,
-            is_segwit,
+        }
+    }
+
+    /// Create a new [`Candidate`] that represents a single input of any script type.
+    ///
+    /// `satisfaction_weight` is the weight the input adds over an unsatisfied `TxIn::default()`,
+    /// which is exactly what miniscript's `Descriptor::max_weight_to_satisfy` returns. It excludes
+    /// the 1-byte `scriptSigLen` and the 1-byte `scriptWitnessLen`, which this adds.
+    pub fn new(value: u64, satisfaction_weight: u64) -> Candidate {
+        Candidate {
+            value,
+            weight: TXIN_BASE_WEIGHT + EMPTY_WITNESS_WEIGHT + satisfaction_weight,
+            input_count: 1,
         }
     }
 

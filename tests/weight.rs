@@ -38,7 +38,6 @@ fn segwit_one_input_one_output() {
             value,
             weight: txin.segwit_weight().to_wu(),
             input_count: 1,
-            is_segwit: true,
         })
         .collect::<Vec<_>>();
 
@@ -86,7 +85,6 @@ fn segwit_two_inputs_one_output() {
             value,
             weight: txin.segwit_weight().to_wu(),
             input_count: 1,
-            is_segwit: true,
         })
         .collect::<Vec<_>>();
 
@@ -132,9 +130,8 @@ fn legacy_three_inputs() {
         .zip(input_values)
         .map(|(txin, value)| Candidate {
             value,
-            weight: txin.legacy_weight().to_wu(),
+            weight: txin.segwit_weight().to_wu(),
             input_count: 1,
-            is_segwit: false,
         })
         .collect::<Vec<_>>();
 
@@ -152,9 +149,11 @@ fn legacy_three_inputs() {
     let mut coin_selector = CoinSelector::new(&candidates, target);
     coin_selector.select_all();
 
+    // Every tx is priced as segwit, so an all-legacy tx pays for the 2 WU witness header and a
+    // 1 WU empty witness per input that it doesn't actually serialize.
     assert_eq!(
         coin_selector.weight(DrainWeights::NONE),
-        orig_weight.to_wu()
+        orig_weight.to_wu() + 2 + 3
     );
     assert_eq!(
         (coin_selector
@@ -163,7 +162,7 @@ fn legacy_three_inputs() {
             .as_sat_vb()
             * 10.0)
             .round(),
-        99.2 * 10.0
+        99.1 * 10.0
     );
 }
 
@@ -184,20 +183,10 @@ fn legacy_three_inputs_one_segwit() {
         .input
         .iter()
         .zip(input_values)
-        .enumerate()
-        .map(|(i, (txin, value))| {
-            let is_segwit = i == 1;
-            Candidate {
-                value,
-                weight: if is_segwit {
-                    txin.segwit_weight()
-                } else {
-                    txin.legacy_weight()
-                }
-                .to_wu(),
-                input_count: 1,
-                is_segwit,
-            }
+        .map(|(txin, value)| Candidate {
+            value,
+            weight: txin.segwit_weight().to_wu(),
+            input_count: 1,
         })
         .collect::<Vec<_>>();
 
@@ -230,5 +219,15 @@ fn new_tr_keyspend_correct_weight() {
     assert_eq!(
         tx.input[0].segwit_weight().to_wu(),
         Candidate::new_tr_keyspend(420).weight
+    );
+}
+
+#[test]
+fn new_adds_satisfaction_weight_to_unsatisfied_txin() {
+    // miniscript's `max_weight_to_satisfy` is the weight over `TxIn::default()`, so passing it
+    // straight to `Candidate::new` must give the real `segwit_weight` for any script type.
+    assert_eq!(
+        Candidate::new(0, 0).weight,
+        bitcoin::TxIn::default().segwit_weight().to_wu()
     );
 }

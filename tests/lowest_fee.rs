@@ -86,7 +86,6 @@ proptest! {
                 value: 20_000,
                 weight: (32 + 4 + 4 + 1) * 4 + 64 + 32,
                 input_count: 1,
-                is_segwit: true,
             };
             params.n_candidates
         ];
@@ -237,20 +236,17 @@ fn does_not_create_change_below_spend_cost() {
             value: 100_000,
             weight: 100,
             input_count: 1,
-            is_segwit: true,
         },
         Candidate {
             value: 50_000,
             weight: 100,
             input_count: 1,
-            is_segwit: true,
         },
         // NOTE: this input has negative effective value
         Candidate {
             value: 10,
             weight: 100,
             input_count: 1,
-            is_segwit: true,
         },
     ];
 
@@ -315,13 +311,11 @@ fn zero_fee_tx() {
             value: 100_000,
             weight: 100,
             input_count: 1,
-            is_segwit: true,
         },
         Candidate {
             value: 50_000,
             weight: 100,
             input_count: 1,
-            is_segwit: true,
         },
     ];
 
@@ -347,7 +341,6 @@ fn err_candidate(value: u64) -> Candidate {
         value,
         weight: 272, // ~1 P2WPKH input
         input_count: 1,
-        is_segwit: true,
     }
 }
 

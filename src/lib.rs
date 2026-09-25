@@ -33,6 +33,13 @@ pub use drain::*;
 /// length.
 pub const TXIN_BASE_WEIGHT: u64 = (32 + 4 + 4 + 1) * 4;
 
+/// The segwit marker and flag bytes. Every transaction is priced as segwit, so this is always
+/// counted.
+const SEGWIT_HEADER_WEIGHT: u64 = 2;
+
+/// The `scriptWitnessLen` byte of an input with an empty witness.
+const EMPTY_WITNESS_WEIGHT: u64 = 1;
+
 /// The weight of a TXOUT with a zero length `scriptPubKey`
 #[allow(clippy::identity_op)]
 pub const TXOUT_BASE_WEIGHT: u64 =
